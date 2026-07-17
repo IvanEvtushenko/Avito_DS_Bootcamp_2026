@@ -100,7 +100,10 @@ def fine_tune_reranker(
     tokenizer = AutoTokenizer.from_pretrained(base_model_name)
     model = AutoModelForSequenceClassification.from_pretrained(base_model_name).to(device)
     model.gradient_checkpointing_enable()  # экономия памяти на 12 ГБ
-    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=lr)
+    # foreach=False обязателен для 12 ГБ: multi-tensor AdamW на .step() аллоцирует
+    # временные буферы размером со все состояния (~4.5 ГБ fp32) поверх постоянных
+    # ~9 ГБ (веса+грады+Adam) → OOM. По-параметрный шаг держит пик ~11.2 ГБ.
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=lr, foreach=False)
     scaler = torch.amp.GradScaler("cuda", enabled=fp16)
     rng = np.random.default_rng(seed)
 

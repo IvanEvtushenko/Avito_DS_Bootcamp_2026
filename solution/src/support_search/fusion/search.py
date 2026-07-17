@@ -44,12 +44,16 @@ def _objective_from_combined(
     ground_truth: Mapping[int, set[int]],
     k: int,
     recall_k: int,
+    objective: str = "recall",
 ) -> tuple[float, float]:
-    """Цель подбора весов для КАНДИДАТОВ: (recall@recall_k, MAP@k) — лексикографически.
+    """Цель подбора весов для КАНДИДАТОВ — лексикографический кортеж (main, tie).
 
-    Работа слияния до реранкера — не упорядочить, а НЕ ПОТЕРЯТЬ релевантные в топ-K
-    (потолок реранкера). Поэтому главный критерий — recall@recall_k, а MAP@k —
-    только тай-брейк при равном recall. Кортеж сравнивается лексикографически.
+    - `objective="recall"` (дефолт): (recall@recall_k, MAP@k). Слияние отбирает
+      кандидатов, поэтому главное — не потерять релевантные в топ-K (потолок
+      реранкера), а MAP@k — только тай-брейк.
+    - `objective="map"`: (MAP@k, recall@recall_k) — максимизируем MAP@10 напрямую.
+
+    Обе метрики считаются всегда; порядок в кортеже задаёт, что главное.
     """
     depth = max(k, recall_k)
     total_recall, total_ap, n = 0.0, 0.0, 0
@@ -63,7 +67,8 @@ def _objective_from_combined(
         n += 1
     if n == 0:
         return (0.0, 0.0)
-    return (total_recall / n, total_ap / n)
+    mean_recall, mean_ap = total_recall / n, total_ap / n
+    return (mean_ap, mean_recall) if objective == "map" else (mean_recall, mean_ap)
 
 
 def _search_on_stack(
@@ -77,15 +82,16 @@ def _search_on_stack(
     n_samples: int,
     k: int,
     recall_k: int,
+    objective: str,
     seed: int,
 ) -> dict[str, float]:
-    """Перебрать веса на подмножестве строк, вернуть лучший вектор по (recall@recall_k, MAP@k)."""
+    """Перебрать веса на подмножестве строк, вернуть лучший вектор по objective."""
     sub = stack[:, rows, :]  # [S, |subset|, A]
     best_weights = None
     best_obj = (-1.0, -1.0)
     for weight_vec in _weight_samples(len(names), n_samples, seed):
         combined = np.tensordot(weight_vec, sub, axes=1)  # [|subset|, A]
-        obj = _objective_from_combined(combined, subset_ids, article_ids, ground_truth, k, recall_k)
+        obj = _objective_from_combined(combined, subset_ids, article_ids, ground_truth, k, recall_k, objective)
         if obj > best_obj:  # лексикографическое сравнение кортежа
             best_obj, best_weights = obj, weight_vec
     return {name: float(best_weights[i]) for i, name in enumerate(names)}
@@ -100,6 +106,7 @@ def search_weights(
     n_samples: int = 500,
     k: int = 10,
     recall_k: int = 30,
+    objective: str = "recall",
     seed: int = 42,
 ) -> dict[str, float]:
     """Подобрать веса на заданном подмножестве запросов (напр. все dev — для теста)."""
@@ -109,7 +116,7 @@ def search_weights(
     rows = [row_of[int(q)] for q in query_ids_subset]
     return _search_on_stack(
         stack, rows, query_ids_subset, article_ids, ground_truth, names,
-        n_samples=n_samples, k=k, recall_k=recall_k, seed=seed,
+        n_samples=n_samples, k=k, recall_k=recall_k, objective=objective, seed=seed,
     )
 
 
@@ -123,6 +130,7 @@ def oof_fusion_search(
     n_samples: int = 500,
     k: int = 10,
     recall_k: int = 30,
+    objective: str = "recall",
     rrf_k: int = 60,
     seed: int = 42,
     depth: int = 100,
@@ -149,7 +157,8 @@ def oof_fusion_search(
     for fold in range(splits.n_splits):
         weights = _search_on_stack(
             stack, [row_of[q] for q in splits.train_ids(fold)], splits.train_ids(fold),
-            article_ids, ground_truth, names, n_samples=n_samples, k=k, recall_k=recall_k, seed=seed + fold,
+            article_ids, ground_truth, names,
+            n_samples=n_samples, k=k, recall_k=recall_k, objective=objective, seed=seed + fold,
         )
         fold_weights[fold] = weights
         weight_vec = np.array([weights[n] for n in names], dtype=np.float32)

@@ -1,0 +1,21 @@
+# FT-пробник: дообучение bge-reranker-v2-m3, 1 эпоха, честный OOF по фолдам (§6).
+# Отдельный artifacts_dir (не затирает zero-shot прогоны). Retrieval-стек — как в
+# default. FT принимается пайплайном, только если бьёт zero-shot по OOF MAP@10.
+#   cd solution && PYTHONPATH=src HF_HUB_OFFLINE=1 python3 -m support_search.cli all --experiment rerank_bge_ft.yaml
+artifacts_dir: artifacts_rr_bge_ft
+reranker:
+  enabled: true
+  backend: sequence_classification
+  model_name: BAAI/bge-reranker-v2-m3
+  revision: 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
+  max_length: 512
+  batch_size: 64
+  use_fp16: true
+  candidate_top_k: 30
+  fine_tune:
+    enabled: true
+    epochs: 1                    # пробуем одну эпоху
+    lr: 2.0e-5
+    batch_groups: 4
+    n_negatives: 7
+    max_length: 384

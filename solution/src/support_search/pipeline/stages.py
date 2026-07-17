@@ -49,6 +49,7 @@ from ..ranking import (
 )
 from ..rerank import (
     CrossEncoderReranker,
+    build_reranker,
     build_training_groups,
     candidate_lists,
     fine_tune_reranker,
@@ -428,13 +429,14 @@ def stage_fuse(cfg: Config) -> Path:
     l2 = float(ltr_cfg.l2)
     use_ranks = bool(ltr_cfg.use_ranks)
     method = str(fusion_cfg.method)
+    objective = str(fusion_cfg.get("objective", "recall"))  # recall@top_c (tie MAP) | map
 
     rows: list[dict] = []
     # OOF всех трёх способов для сравнения; финал берёт настроенный method.
     # Цель подбора весов для кандидатов — recall@candidate_top_k (tie MAP@k).
     oof_ws, fold_weights, oof_ws_m = oof_fusion_search(
         cal, gt, splits, names=names, method="weighted_sum",
-        n_samples=n_samples, k=k, recall_k=top_c, seed=cfg.seed, depth=depth,
+        n_samples=n_samples, k=k, recall_k=top_c, objective=objective, seed=cfg.seed, depth=depth,
     )
     res_ws = evaluate(oof_ws, gt_dev, name="fusion_weighted/dev_oof", k=k, recall_ks=recall_ks).compute_ci(**ci_kw)
     rows.append({"retriever": "fusion_weighted", "split": "dev_oof", **res_ws.to_row()})
@@ -471,7 +473,7 @@ def stage_fuse(cfg: Config) -> Path:
     final_weights: dict = {}
     coefficients: dict = {}
     if method == "weighted_sum":
-        final_weights = search_weights(cal, gt, splits.dev, names=names, n_samples=n_samples, k=k, recall_k=top_c, seed=cfg.seed)
+        final_weights = search_weights(cal, gt, splits.dev, names=names, n_samples=n_samples, k=k, recall_k=top_c, objective=objective, seed=cfg.seed)
         fused_cal = weighted_sum(cal, final_weights)
         fused_test = weighted_sum(test, final_weights)
         logger.info("итоговые веса fusion (dev): %s", {n: round(w, 3) for n, w in final_weights.items()})
@@ -596,10 +598,8 @@ def stage_rerank(cfg: Config, *, force: bool = False) -> Path:
 
     # --- Zero-shot ---
     device = rr.get("device", None)
-    reranker = CrossEncoderReranker(
-        str(rr.model_name), device=str(device) if device else None,
-        max_length=int(rr.max_length), batch_size=int(rr.batch_size), use_fp16=bool(rr.use_fp16),
-    )
+    backend = str(rr.get("backend", "sequence_classification"))
+    reranker = build_reranker(rr)  # выбор модели по reranker.backend (дефолт — bge cross-encoder)
     zs_cal = rerank_to_matrix(reranker, qtext_cal, fusion_cal.query_ids, article_ids, cand_cal, pass_cal, source="reranker_zs")
     zs_test = rerank_to_matrix(reranker, qtext_test, fusion_test.query_ids, article_ids, cand_test, pass_test, source="reranker_zs")
     del reranker
@@ -616,6 +616,10 @@ def stage_rerank(cfg: Config, *, force: bool = False) -> Path:
     # --- Fine-tune (по фолдам, честный OOF) ---
     ft_cfg = rr.fine_tune
     if bool(ft_cfg.enabled):
+        # FT реализован только для cross-encoder head (bge). Для causal-LM/listwise/GGUF
+        # backend-ов дообучение не поддержано — падаем сразу, а не молча инференсим не то.
+        if backend != "sequence_classification":
+            raise ValueError(f"reranker.fine_tune не поддержан для backend={backend!r} (только sequence_classification)")
         n_neg = int(ft_cfg.n_negatives)
         qtext_by_qid = {int(q): qtext_cal[i] for i, q in enumerate(fusion_cal.query_ids)}
         cand_by_qid = {int(q): cand_cal[i] for i, q in enumerate(fusion_cal.query_ids)}

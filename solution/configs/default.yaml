@@ -77,8 +77,12 @@ fusion:                         # слияние кандидатов (этап 
   # recall@candidate_top_k (tie MAP@k), а не MAP. Упорядочивание — дело реранкера
   # и mini-LTR ниже. lr — альтернатива (ablation).
   method: weighted_sum          # weighted_sum (дефолт) | lr | rrf
+  # Что максимизирует подбор весов (method=weighted_sum):
+  #   recall — (recall@candidate_top_k, tie MAP@k), дефолт для отбора кандидатов;
+  #   map    — MAP@k напрямую. Переключается одной строкой (и обратно).
+  objective: map             # recall | map
   sources: null                 # null → все включённые ретриверы
-  rrf_k: 40                     # k для RRF-альтернативы
+  rrf_k: 60                     # k для RRF-альтернативы
   candidate_top_k: 30           # сколько кандидатов сохранять (потолок для реранкера)
   random_search:
     n_samples: 500              # сэмплов весов для method=weighted_sum (ablation, §4.3)
@@ -88,6 +92,8 @@ fusion:                         # слияние кандидатов (этап 
 
 reranker:                       # cross-encoder reranker (этап 6)
   enabled: true
+  backend: sequence_classification  # семейство модели: sequence_classification (bge, дефолт) |
+                                    # qwen3_causal_lm | jina_listwise | llama_cpp_qwen3 (см. configs/experiments/rerank_*)
   model_name: BAAI/bge-reranker-v2-m3
   device: null                  # null → cuda, если доступна
   max_length: 512

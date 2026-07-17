@@ -1,0 +1,18 @@
+# Ablation §6: реранкер jinaai/jina-reranker-v3 (listwise, trust_remote_code).
+# Листовой: запрос и весь его список кандидатов оцениваются совместно через
+# model.rerank(...) (apply.rerank_to_matrix сам выбирает listwise-путь).
+# Retrieval-стек — как в default. Revision закреплён.
+#   cd solution && HF_HUB_OFFLINE=1 python3 -m support_search.cli all --experiment rerank_jina_v3.yaml
+artifacts_dir: artifacts_rr_jina_v3
+reranker:
+  enabled: true
+  backend: jina_listwise
+  model_name: jinaai/jina-reranker-v3
+  revision: 10fb694fc21f7a710a563ff1eb977a460f3868e4
+  trust_remote_code: true
+  use_fp16: true
+  max_doc_length: 2048          # пассаж = title + best dense chunk, короткий
+  max_query_length: 512
+  candidate_top_k: 50           # общий для всех rerank_*
+  fine_tune:
+    enabled: false

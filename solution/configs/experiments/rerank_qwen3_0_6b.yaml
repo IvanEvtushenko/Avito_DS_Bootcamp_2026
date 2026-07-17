@@ -1,0 +1,20 @@
+# Ablation §6: реранкер Qwen/Qwen3-Reranker-0.6B (instruction-aware, causal-LM yes/no).
+# Скор пары = P(yes) по логитам последней позиции (рецепт из карточки модели).
+# Retrieval-стек — как в default; меняем только реранкер. Revision закреплён.
+#   cd solution && HF_HUB_OFFLINE=1 python3 -m support_search.cli all --experiment rerank_qwen3_0_6b.yaml
+artifacts_dir: artifacts_rr_qwen3_0_6b
+reranker:
+  enabled: true
+  backend: qwen3_causal_lm
+  model_name: Qwen/Qwen3-Reranker-0.6B
+  revision: e61197ed45024b0ed8a2d74b80b4d909f1255473
+  instruction: >-
+    Given a Russian customer support query, rank help-center passages by how
+    directly and completely they answer the user's issue. Multiple passages
+    may be relevant.
+  max_length: 512
+  batch_size: 16
+  use_fp16: true
+  candidate_top_k: 50           # общий для всех rerank_*
+  fine_tune:
+    enabled: false

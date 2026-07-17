@@ -1,0 +1,23 @@
+# Ablation §6: реранкер Qwen3-Reranker-8B в Q4_K_M GGUF (llama.cpp, causal-LM yes/no).
+# Q4_K_M (~5 ГБ) выбран, чтобы 8B влезла в 12 ГБ VRAM. Тот же yes/no протокол.
+# ВНИМАНИЕ: требует пакет llama-cpp-python (CUDA-сборка) — если не установлен,
+# backend падает с инструкцией. Retrieval-стек — как в default. Revision закреплён.
+#   CMAKE_ARGS='-DGGML_CUDA=on' pip install llama-cpp-python   # один раз
+#   cd solution && HF_HUB_OFFLINE=1 python3 -m support_search.cli all --experiment rerank_qwen3_8b_q4_k_m.yaml
+artifacts_dir: artifacts_rr_qwen3_8b_q4_k_m
+reranker:
+  enabled: true
+  backend: llama_cpp_qwen3
+  model_name: QuantFactory/Qwen3-Reranker-8B-GGUF
+  revision: 8aef9ea87547262501e4224282a5e53a2335ba7d
+  base_model_name: Qwen/Qwen3-Reranker-8B
+  model_file: Qwen3-Reranker-8B.Q4_K_M.gguf
+  quantization: Q4_K_M
+  instruction: >-
+    Given a Russian customer support query, rank help-center passages by how
+    directly and completely they answer the user's issue. Multiple passages
+    may be relevant.
+  max_length: 512
+  candidate_top_k: 50           # общий для всех rerank_*
+  fine_tune:
+    enabled: false

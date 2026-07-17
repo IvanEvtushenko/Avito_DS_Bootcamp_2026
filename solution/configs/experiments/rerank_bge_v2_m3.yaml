@@ -1,0 +1,16 @@
+# Ablation §6: реранкер BAAI/bge-reranker-v2-m3 (cross-encoder, sequence_classification).
+# Baseline сравнения реранкеров: retrieval-стек (эмбеддер + fusion) держим как в
+# default — меняем только реранкер. Веса в HF cache, revision закреплён.
+#   cd solution && HF_HUB_OFFLINE=1 python3 -m support_search.cli all --experiment rerank_bge_v2_m3.yaml
+artifacts_dir: artifacts_rr_bge_v2_m3
+reranker:
+  enabled: true
+  backend: sequence_classification
+  model_name: BAAI/bge-reranker-v2-m3
+  revision: 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
+  max_length: 512
+  batch_size: 64
+  use_fp16: true
+  candidate_top_k: 50           # общий для всех rerank_* — иначе сравнение нечестно
+  fine_tune:
+    enabled: false

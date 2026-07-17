@@ -42,6 +42,7 @@ class CrossEncoderReranker:
         max_length: int = 512,
         batch_size: int = 64,
         use_fp16: bool = True,
+        revision: str | None = None,
     ) -> None:
         import torch
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -53,10 +54,10 @@ class CrossEncoderReranker:
         self.batch_size = batch_size
         self.use_fp16 = use_fp16 and self.device.startswith("cuda")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, revision=revision)
         dtype = torch.float16 if self.use_fp16 else torch.float32
         self.model = AutoModelForSequenceClassification.from_pretrained(
-            model_name_or_path, torch_dtype=dtype
+            model_name_or_path, revision=revision, torch_dtype=dtype
         ).to(self.device).eval()
         logger.info(
             "CrossEncoderReranker: model=%s device=%s fp16=%s max_len=%d",

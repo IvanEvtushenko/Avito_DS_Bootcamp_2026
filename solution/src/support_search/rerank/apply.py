@@ -54,6 +54,17 @@ def rerank_to_matrix(
     col_of = {int(a): j for j, a in enumerate(article_ids)}
     scores = np.full((len(query_ids), len(article_ids)), NON_CANDIDATE, dtype=np.float32)
 
+    # Листовой реранкер (напр. jina): запрос и весь его список кандидатов — вместе,
+    # по-запросно, а не одной сплющенной пачкой пар.
+    if hasattr(reranker, "score_listwise"):
+        for i, (cands, passs) in enumerate(zip(cand_lists, passages)):
+            if not cands:
+                continue
+            row_scores = reranker.score_listwise(query_texts[i], list(passs))
+            for aid, s in zip(cands, row_scores):
+                scores[i, col_of[int(aid)]] = float(s)
+        return ScoreMatrix(query_ids=np.asarray(query_ids), article_ids=np.asarray(article_ids), scores=scores, source=source)
+
     flat_queries: list[str] = []
     flat_passages: list[str] = []
     positions: list[tuple[int, int]] = []

@@ -1,0 +1,16 @@
+# Ablation §7.3: эмбеддер deepvk/USER-bge-m3 (русскоязычный bge-m3, CLS, без префиксов).
+#   python3 -m support_search.cli all --experiment emb_user_bge_m3.yaml
+artifacts_dir: artifacts_emb_user_bge_m3
+retrievers:
+  dense:
+    model_name: deepvk/USER-bge-m3
+    pooling: cls
+    model_class: auto
+    query_prefix: ""
+    passage_prefix: ""
+reranker:
+  enabled: false
+ranking:
+  method: none
+export:
+  primary_source: fusion

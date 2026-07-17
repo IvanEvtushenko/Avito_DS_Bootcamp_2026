@@ -56,24 +56,35 @@ retrievers:
     sublinear_tf: true
     title_weight: 2.0
   dense:                        # bi-encoder (этап 4). Чанкинг берётся из preprocess.chunking.
+    # Выбран сравнением эмбеддеров (см. README_EMB.md): BAAI/bge-m3 —
+    # fusion OOF MAP@10 0.501 против 0.484 у e5-large (прирост не значим по CI,
+    # p≈0.18, но стабилен). Альтернативы — configs/experiments/emb_*.yaml.
     enabled: true
-    model_name: intfloat/multilingual-e5-large
+    model_name: BAAI/bge-m3
     device: null                # null → cuda, если доступна, иначе cpu
     max_seq_len: 512
     batch_size: 64
     use_fp16: true
     w_title: 0.5                # вклад косинуса заголовка (дешёвый параметр §4.3)
-    query_prefix: "query: "
-    passage_prefix: "passage: "
+    query_prefix: ""            # bge-семейство: без префиксов
+    passage_prefix: ""
+    pooling: cls                # mean (e5) | cls (BGE-семейство)
+    model_class: auto           # auto (XLM-R) | t5_encoder (FRIDA)
 
 fusion:                         # слияние кандидатов (этап 5)
   enabled: true
-  method: weighted_sum          # weighted_sum | rrf
+  # Слияние — для ОТБОРА кандидатов, поэтому подбор весов по сетке максимизирует
+  # recall@candidate_top_k (tie MAP@k), а не MAP. Упорядочивание — дело реранкера
+  # и mini-LTR ниже. lr — альтернатива (ablation).
+  method: weighted_sum          # weighted_sum (дефолт) | lr | rrf
   sources: null                 # null → все включённые ретриверы
-  rrf_k: 60                     # k для RRF-альтернативы
-  candidate_top_k: 50           # сколько кандидатов сохранять (потолок для реранкера)
+  rrf_k: 40                     # k для RRF-альтернативы
+  candidate_top_k: 30           # сколько кандидатов сохранять (потолок для реранкера)
   random_search:
-    n_samples: 500              # ~сэмплов весов в совместном поиске (§4.3)
+    n_samples: 500              # сэмплов весов для method=weighted_sum (ablation, §4.3)
+  ltr:                          # параметры LR-слияния
+    l2: 1.0                     # сила L2-регуляризации
+    use_ranks: true             # добавлять обратные ранги источников как признаки
 
 reranker:                       # cross-encoder reranker (этап 6)
   enabled: true
@@ -82,7 +93,7 @@ reranker:                       # cross-encoder reranker (этап 6)
   max_length: 512
   batch_size: 64
   use_fp16: true
-  candidate_top_k: 50           # сколько кандидатов fusion переоценивать
+  candidate_top_k: 30           # сколько кандидатов fusion переоценивать
   fine_tune:                    # zero-shot по умолчанию; FT сравнивается по OOF (§6, фолбэк)
     enabled: false
     epochs: 2
@@ -92,12 +103,15 @@ reranker:                       # cross-encoder reranker (этап 6)
     max_length: 384
 
 ranking:                        # финальное ранжирование (этап 7)
-  method: blend                 # blend(fusion_score, reranker_score)
-  weight_grid: 51               # размер сетки поиска веса бленда
+  method: lr                    # lr (mini-LTR §7.2, дефолт) | blend (ручной вес)
+  weight_grid: 51               # размер сетки поиска веса для method=blend (ablation)
+  ltr:                          # параметры mini-LTR
+    l2: 1.0
+    use_ranks: true
 
 evaluation:
   k: 10                         # MAP@k
-  recall_ks: [10, 20, 50, 100]
+  recall_ks: [10, 20, 30, 100]
   bootstrap_resamples: 10000
   ci: 0.95
 

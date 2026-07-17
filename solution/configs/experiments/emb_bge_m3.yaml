@@ -1,0 +1,17 @@
+# Ablation §7.3: эмбеддер BAAI/bge-m3 (CLS-пулинг, без префиксов).
+# Отдельный artifacts_dir; реранкер выключен — сравниваем эмбеддеры по fusion.
+#   python3 -m support_search.cli all --experiment emb_bge_m3.yaml
+artifacts_dir: artifacts_emb_bge_m3
+retrievers:
+  dense:
+    model_name: BAAI/bge-m3
+    pooling: cls
+    model_class: auto
+    query_prefix: ""
+    passage_prefix: ""
+reranker:
+  enabled: false
+ranking:
+  method: none
+export:
+  primary_source: fusion

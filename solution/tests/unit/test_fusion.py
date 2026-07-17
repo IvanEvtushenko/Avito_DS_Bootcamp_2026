@@ -81,12 +81,13 @@ class TestOOF(unittest.TestCase):
         gt = {q: {aids[q % 4]} for q in qids}
         splits = make_splits({q: 1 for q in qids}, n_splits=5, holdout_frac=0.2, seed=0)
 
-        oof, fold_weights = oof_fusion_search(
+        oof, fold_weights, oof_matrix = oof_fusion_search(
             {"a": a, "b": b}, gt, splits, names=["a", "b"],
-            method="weighted_sum", n_samples=50, k=10, depth=4, seed=0,
+            method="weighted_sum", n_samples=50, k=10, recall_k=4, depth=4, seed=0,
         )
         self.assertEqual(set(oof), set(splits.dev))          # только dev
         self.assertEqual(len(fold_weights), splits.n_splits)  # веса на каждый фолд
+        self.assertEqual(oof_matrix.shape, (n, 4))            # OOF-матрица (для calibration без утечки)
         for ranking in oof.values():
             self.assertLessEqual(len(ranking), 4)
 

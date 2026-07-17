@@ -28,10 +28,25 @@ from ..data.io import (
 from ..data.splits import Splits, make_splits
 from ..eval import evaluate, paired_permutation_test
 from ..export import build_answer, validate_answer_file, write_answer
-from ..fusion import oof_fusion_search, reciprocal_rank_fusion, search_weights, weighted_sum
+from ..fusion import (
+    fit_fusion_ltr,
+    oof_fusion_ltr,
+    oof_fusion_search,
+    predict_fusion_ltr,
+    reciprocal_rank_fusion,
+    search_weights,
+    weighted_sum,
+)
 from ..logging_utils import get_logger
 from ..preprocess import Tokenizer, chunk_text
-from ..ranking import blend_matrix, oof_blend, search_blend_weight
+from ..ranking import (
+    blend_matrix,
+    fit_blend_ltr,
+    oof_blend,
+    oof_blend_ltr,
+    predict_blend_ltr,
+    search_blend_weight,
+)
 from ..rerank import (
     CrossEncoderReranker,
     build_training_groups,
@@ -97,6 +112,7 @@ def _build_encoder(cfg: Config) -> E5Encoder:
         device=str(device) if device else None,
         max_seq_len=int(d.max_seq_len), batch_size=int(d.batch_size),
         use_fp16=bool(d.use_fp16), query_prefix=str(d.query_prefix), passage_prefix=str(d.passage_prefix),
+        pooling=str(d.get("pooling", "mean")), model_class=str(d.get("model_class", "auto")),
     )
 
 
@@ -257,6 +273,7 @@ def stage_retrieve(cfg: Config, *, force: bool = False) -> Path:
         if (sd.path / "calibration.npz").exists() and sd.is_fresh() and not force:
             logger.info("scores/%s свежи — пропуск", name)
             continue
+        sd.path.mkdir(parents=True, exist_ok=True)  # np.save (dense q_emb) не создаёт каталог
 
         retriever = _build_retriever(cfg, name, tokenizer)
         retriever.fit(corpus)
@@ -407,41 +424,74 @@ def stage_fuse(cfg: Config) -> Path:
     rrf_k = int(fusion_cfg.rrf_k)
     ci_kw = dict(n_resamples=int(eval_cfg.bootstrap_resamples), ci=float(eval_cfg.ci), seed=cfg.seed)
 
+    ltr_cfg = fusion_cfg.ltr
+    l2 = float(ltr_cfg.l2)
+    use_ranks = bool(ltr_cfg.use_ranks)
+    method = str(fusion_cfg.method)
+
     rows: list[dict] = []
-    # OOF: weighted sum (веса — random search на train(f)) и RRF (без параметров).
-    oof_ws, fold_weights = oof_fusion_search(
-        cal, gt, splits, names=names, method="weighted_sum", n_samples=n_samples, k=k, seed=cfg.seed, depth=depth
+    # OOF всех трёх способов для сравнения; финал берёт настроенный method.
+    # Цель подбора весов для кандидатов — recall@candidate_top_k (tie MAP@k).
+    oof_ws, fold_weights, oof_ws_m = oof_fusion_search(
+        cal, gt, splits, names=names, method="weighted_sum",
+        n_samples=n_samples, k=k, recall_k=top_c, seed=cfg.seed, depth=depth,
     )
     res_ws = evaluate(oof_ws, gt_dev, name="fusion_weighted/dev_oof", k=k, recall_ks=recall_ks).compute_ci(**ci_kw)
     rows.append({"retriever": "fusion_weighted", "split": "dev_oof", **res_ws.to_row()})
     logger.info(res_ws.summary())
 
-    oof_rrf, _ = oof_fusion_search(
-        cal, gt, splits, names=names, method="rrf", rrf_k=rrf_k, k=k, seed=cfg.seed, depth=depth
+    oof_rrf, _, oof_rrf_m = oof_fusion_search(
+        cal, gt, splits, names=names, method="rrf", rrf_k=rrf_k, k=k, recall_k=top_c, seed=cfg.seed, depth=depth
     )
     res_rrf = evaluate(oof_rrf, gt_dev, name="fusion_rrf/dev_oof", k=k, recall_ks=recall_ks).compute_ci(**ci_kw)
     rows.append({"retriever": "fusion_rrf", "split": "dev_oof", **res_rrf.to_row()})
     logger.info(res_rrf.summary())
 
-    # Значимость fusion → BM25 на dev (парный permutation).
+    oof_lr, feature_names, oof_lr_m = oof_fusion_ltr(cal, gt, splits, names=names, l2=l2, use_ranks=use_ranks, depth=depth)
+    res_lr = evaluate(oof_lr, gt_dev, name="fusion_lr/dev_oof", k=k, recall_ks=recall_ks).compute_ci(**ci_kw)
+    rows.append({"retriever": "fusion_lr", "split": "dev_oof", **res_lr.to_row()})
+    logger.info(res_lr.summary())
+
+    oof_by_method = {
+        "weighted_sum": (oof_ws, res_ws, oof_ws_m),
+        "rrf": (oof_rrf, res_rrf, oof_rrf_m),
+        "lr": (oof_lr, res_lr, oof_lr_m),
+    }
+    oof_primary, res_primary, oof_primary_m = oof_by_method[method]
+
+    # Значимость fusion(method) → BM25 на dev (парный permutation).
     significance: dict[str, float] = {}
     if "bm25" in cal:
         bm25_dev = evaluate(cal["bm25"].rankings(depth), gt_dev, name="bm25/dev", k=k, recall_ks=recall_ks)
-        p = paired_permutation_test(res_ws.ap_array, bm25_dev.ap_array, seed=cfg.seed)
-        significance["fusion_weighted_vs_bm25"] = round(p, 4)
-        logger.info("значимость dev fusion_weighted vs bm25: p=%.4f", p)
+        p = paired_permutation_test(res_primary.ap_array, bm25_dev.ap_array, seed=cfg.seed)
+        significance[f"fusion_{method}_vs_bm25"] = round(p, 4)
+        logger.info("значимость dev fusion_%s vs bm25: p=%.4f", method, p)
 
-    # Финал: веса на всех dev → применяем к cal и test.
-    method = str(fusion_cfg.method)
+    # Финал: обучаем/подбираем на всех dev → all-dev fusion для cal и test.
+    final_weights: dict = {}
+    coefficients: dict = {}
     if method == "weighted_sum":
-        final_weights = search_weights(cal, gt, splits.dev, names=names, n_samples=n_samples, k=k, seed=cfg.seed)
+        final_weights = search_weights(cal, gt, splits.dev, names=names, n_samples=n_samples, k=k, recall_k=top_c, seed=cfg.seed)
         fused_cal = weighted_sum(cal, final_weights)
         fused_test = weighted_sum(test, final_weights)
         logger.info("итоговые веса fusion (dev): %s", {n: round(w, 3) for n, w in final_weights.items()})
-    else:
-        final_weights = {}
+    elif method == "lr":
+        lr, feature_names = fit_fusion_ltr(cal, gt, splits.dev, names=names, l2=l2, use_ranks=use_ranks)
+        fused_cal = predict_fusion_ltr(lr, cal, names=names, use_ranks=use_ranks)
+        fused_test = predict_fusion_ltr(lr, test, names=names, use_ranks=use_ranks)
+        coefficients = lr.coefficients(feature_names)
+        logger.info("итоговые коэффициенты LR fusion (dev): %s", coefficients)
+    else:  # rrf
         fused_cal = reciprocal_rank_fusion(cal, k=rrf_k)
         fused_test = reciprocal_rank_fusion(test, k=rrf_k)
+
+    # БЕЗ УТЕЧКИ (§4.2): строки dev в calibration.npz — из OOF (веса не видели свой
+    # запрос), holdout — из all-dev. Реранкер и блэнд берут кандидаты/признаки dev
+    # именно отсюда, поэтому их OOF-оценка честная.
+    assert np.array_equal(fused_cal.query_ids, oof_primary_m.query_ids)
+    row_of_cal = {int(q): i for i, q in enumerate(fused_cal.query_ids)}
+    for q in splits.dev:
+        fused_cal.scores[row_of_cal[q]] = oof_primary_m.scores[row_of_cal[q]]
 
     valid_ids = cal[names[0]].article_ids
     check_score_matrix(fused_cal, valid_ids)
@@ -453,18 +503,17 @@ def stage_fuse(cfg: Config) -> Path:
     )
     fused_cal.save(sd.path / "calibration.npz")
     fused_test.save(sd.path / "test.npz")
+    recall_ceiling = round(res_primary.recall_at_k.get(top_c, 0.0), 4)
     sd.write_manifest(
-        method=method, sources=list(names), final_weights=final_weights,
+        method=method, sources=list(names), final_weights=final_weights, coefficients=coefficients,
         fold_weights={str(f): w for f, w in fold_weights.items()},
-        oof_map=round(res_ws.map_at_k, 4), recall_at_50_oof=round(res_ws.recall_at_k.get(50, 0.0), 4),
+        oof_map=round(res_primary.map_at_k, 4), recall_at_ceiling_oof=recall_ceiling, ceiling_k=top_c,
     )
 
-    # Кандидаты для реранкера (этап 6): test (финальные веса) и dev OOF (честные).
+    # Кандидаты для реранкера (этап 6): test (финал method) и dev OOF (честные).
     cand_dir = stage_dir(cfg, "candidates")
     fused_test.to_retrieval_frame(top_c).to_parquet(cand_dir / "test.parquet", index=False)
-    _oof_candidates_frame(oof_ws if method == "weighted_sum" else oof_rrf, top_c).to_parquet(
-        cand_dir / "dev_oof.parquet", index=False
-    )
+    _oof_candidates_frame(oof_primary, top_c).to_parquet(cand_dir / "dev_oof.parquet", index=False)
 
     runs_dir = stage_dir(cfg, "runs")
     created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -472,17 +521,17 @@ def stage_fuse(cfg: Config) -> Path:
     write_json(
         runs_dir / "fusion_report.json",
         {"created_at": created_at, "config_hash": config_hash, "method": method, "sources": list(names),
-         "final_weights": final_weights, "fold_weights": {str(f): w for f, w in fold_weights.items()},
-         "significance": significance, "rows": rows, "recall_at_50_oof": round(res_ws.recall_at_k.get(50, 0.0), 4)},
+         "final_weights": final_weights, "coefficients": coefficients,
+         "fold_weights": {str(f): w for f, w in fold_weights.items()},
+         "significance": significance, "rows": rows, "recall_at_ceiling_oof": recall_ceiling, "ceiling_k": top_c},
     )
-    # OOF per-query AP гибрида — для проверки значимости hybrid→rerank на этапе 7.
-    write_json(runs_dir / "fusion_oof_ap.json", {str(q): ap for q, ap in res_ws.per_query_ap.items()})
+    # OOF per-query AP гибрида (method) — для проверки значимости hybrid→rerank (этап 7).
+    write_json(runs_dir / "fusion_oof_ap.json", {str(q): ap for q, ap in res_primary.per_query_ap.items()})
     _append_experiments(runs_dir / "experiments.csv", rows, config_hash, created_at)
 
-    r50 = res_ws.recall_at_k.get(50, 0.0)
     logger.info(
-        "fuse: OOF recall@%d=%.3f (потолок реранкера) — %s",
-        top_c, r50, "OK ≥0.97" if r50 >= 0.97 else "ниже 0.97, см. план §5 (расширить кандидатов)",
+        "fuse[%s]: OOF recall@%d=%.3f (потолок реранкера) — %s",
+        method, top_c, recall_ceiling, "OK ≥0.95" if recall_ceiling >= 0.95 else "ниже 0.95, расширить кандидатов",
     )
     return sd.path
 
@@ -652,12 +701,15 @@ def _require(path: Path, produced_by: str) -> Path:
 
 # ─── стадия: финальный блэнд ─────────────────────────────────────────────
 def stage_blend(cfg: Config) -> Path:
-    """blend(fusion, reranker) с честным OOF-подбором веса → финальная матрица."""
+    """Финальное ранжирование: mini-LTR (дефолт) или ручной blend, честный OOF."""
     scores_dir = stage_dir(cfg, "scores")
     fusion_cal = ScoreMatrix.load(_require(scores_dir / "fusion" / "calibration.npz", "fuse"))
     fusion_test = ScoreMatrix.load(scores_dir / "fusion" / "test.npz")
     reranker_cal = ScoreMatrix.load(_require(scores_dir / "reranker" / "calibration.npz", "rerank"))
     reranker_test = ScoreMatrix.load(scores_dir / "reranker" / "test.npz")
+    names = _fusion_sources(cfg)  # источники для mini-LTR: bm25/char/dense
+    src_cal = _load_matrices(cfg, names, "calibration")
+    src_test = _load_matrices(cfg, names, "test")
 
     gt = parse_ground_truth(load_calibration(cfg))
     splits = _load_splits(cfg)
@@ -666,30 +718,54 @@ def stage_blend(cfg: Config) -> Path:
     k = int(eval_cfg.k)
     recall_ks = [int(x) for x in eval_cfg.recall_ks]
     depth = max(recall_ks + [k])
-    grid = int(cfg.section("ranking").weight_grid)
+    ranking_cfg = cfg.section("ranking")
+    method = str(ranking_cfg.method)
+    grid = int(ranking_cfg.weight_grid)
+    l2 = float(ranking_cfg.ltr.l2)
+    use_ranks = bool(ranking_cfg.ltr.use_ranks)
     ci_kw = dict(n_resamples=int(eval_cfg.bootstrap_resamples), ci=float(eval_cfg.ci), seed=cfg.seed)
 
-    oof, fold_weights = oof_blend(fusion_cal, reranker_cal, gt, splits, k=k, depth=depth, grid=grid)
-    res = evaluate(oof, gt_dev, name="blend/dev_oof", k=k, recall_ks=recall_ks).compute_ci(**ci_kw)
-    logger.info(res.summary())
+    rows: list[dict] = []
+    # OOF обоих способов для сравнения; финал берёт настроенный method.
+    oof_manual, fold_weights = oof_blend(fusion_cal, reranker_cal, gt, splits, k=k, depth=depth, grid=grid)
+    res_manual = evaluate(oof_manual, gt_dev, name="blend/dev_oof", k=k, recall_ks=recall_ks).compute_ci(**ci_kw)
+    rows.append({"retriever": "blend", "split": "dev_oof", **res_manual.to_row()})
+    logger.info(res_manual.summary())
 
-    # Значимость hybrid→rerank: blend против OOF-гибрида (per-query AP из этапа 5).
+    oof_lr, feature_names = oof_blend_ltr(src_cal, reranker_cal, gt, splits, names=names, l2=l2, use_ranks=use_ranks, depth=depth)
+    res_lr = evaluate(oof_lr, gt_dev, name="blend_lr/dev_oof", k=k, recall_ks=recall_ks).compute_ci(**ci_kw)
+    rows.append({"retriever": "blend_lr", "split": "dev_oof", **res_lr.to_row()})
+    logger.info(res_lr.summary())
+
+    res_primary = res_lr if method == "lr" else res_manual
+
+    # Значимость final→hybrid: против OOF-гибрида (per-query AP из этапа 5).
     significance = {}
     fusion_ap_path = stage_dir(cfg, "runs") / "fusion_oof_ap.json"
     if fusion_ap_path.exists():
         fusion_ap = {int(q): float(v) for q, v in read_json(fusion_ap_path).items()}
-        common = sorted(set(res.per_query_ap) & set(fusion_ap))
+        common = sorted(set(res_primary.per_query_ap) & set(fusion_ap))
         p = paired_permutation_test(
-            np.array([res.per_query_ap[q] for q in common]),
+            np.array([res_primary.per_query_ap[q] for q in common]),
             np.array([fusion_ap[q] for q in common]), seed=cfg.seed,
         )
-        significance["blend_vs_fusion"] = round(p, 4)
-        logger.info("значимость dev blend vs fusion: p=%.4f", p)
+        significance[f"{method}_vs_fusion"] = round(p, 4)
+        logger.info("значимость dev %s vs fusion: p=%.4f", method, p)
 
-    final_weight = search_blend_weight(fusion_cal, reranker_cal, gt, splits.dev, k=k, grid=grid)
-    final_cal = blend_matrix(fusion_cal, reranker_cal, weight=final_weight)
-    final_test = blend_matrix(fusion_test, reranker_test, weight=final_weight)
-    logger.info("итоговый вес блэнда (dev): fusion=%.2f reranker=%.2f", final_weight, 1 - final_weight)
+    # Финал: обучаем/подбираем на всех dev.
+    final_weight = None
+    coefficients: dict = {}
+    if method == "lr":
+        lr, feature_names = fit_blend_ltr(src_cal, reranker_cal, gt, splits.dev, names=names, l2=l2, use_ranks=use_ranks)
+        final_cal = predict_blend_ltr(lr, src_cal, reranker_cal, names=names, use_ranks=use_ranks)
+        final_test = predict_blend_ltr(lr, src_test, reranker_test, names=names, use_ranks=use_ranks)
+        coefficients = lr.coefficients(feature_names)
+        logger.info("итоговые коэффициенты mini-LTR (dev): %s", coefficients)
+    else:
+        final_weight = search_blend_weight(fusion_cal, reranker_cal, gt, splits.dev, k=k, grid=grid)
+        final_cal = blend_matrix(fusion_cal, reranker_cal, weight=final_weight)
+        final_test = blend_matrix(fusion_test, reranker_test, weight=final_weight)
+        logger.info("итоговый вес блэнда (dev): fusion=%.2f reranker=%.2f", final_weight, 1 - final_weight)
 
     sd = StageDir(
         cfg, "scores", stage_dir(cfg, "scores", subdir="blend"), SCHEMA_BLEND,
@@ -700,15 +776,15 @@ def stage_blend(cfg: Config) -> Path:
     check_score_matrix(final_test, fusion_test.article_ids)
     final_cal.save(sd.path / "calibration.npz")
     final_test.save(sd.path / "test.npz")
-    sd.write_manifest(weight_fusion=round(final_weight, 4), fold_weights={str(f): round(w, 4) for f, w in fold_weights.items()},
-                      oof_map=round(res.map_at_k, 4))
+    sd.write_manifest(method=method, weight_fusion=final_weight, coefficients=coefficients,
+                      oof_map=round(res_primary.map_at_k, 4))
 
     runs_dir = stage_dir(cfg, "runs")
     created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     config_hash = cfg.hash_section("ranking", "reranker", "fusion", "retrievers", "preprocess")
-    rows = [{"retriever": "blend", "split": "dev_oof", **res.to_row()}]
     write_json(runs_dir / "blend_report.json",
-               {"created_at": created_at, "config_hash": config_hash, "weight_fusion": final_weight,
+               {"created_at": created_at, "config_hash": config_hash, "method": method,
+                "weight_fusion": final_weight, "coefficients": coefficients,
                 "significance": significance, "rows": rows})
     _append_experiments(runs_dir / "experiments.csv", rows, config_hash, created_at)
     return sd.path

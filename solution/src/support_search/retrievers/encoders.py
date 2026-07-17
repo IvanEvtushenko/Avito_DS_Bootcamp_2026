@@ -39,11 +39,16 @@ class Encoder(Protocol):
 
 
 class E5Encoder:
-    """`intfloat/multilingual-e5-large` через transformers (average pool + L2).
+    """HF bi-encoder через transformers (пулинг + L2), дефолт — e5-large.
+
+    Один класс покрывает разные retrieval-модели: пулинг (`mean` для e5, `cls`
+    для BGE-семейства), архитектуру (`auto` для XLM-R, `t5_encoder` для FRIDA) и
+    префиксы (`query:`/`passage:` у e5, `search_query:`/`search_document:` у
+    FRIDA, пустые у BGE). Это делает сравнение эмбеддеров (§7.3) честным — у
+    каждой модели её собственный протокол кодирования.
 
     Тяжёлые импорты (`torch`, `transformers`) и загрузка модели — лениво в
-    конструкторе, поэтому импорт модуля не требует GPU. По умолчанию fp16 на
-    CUDA: модель (~560M параметров) свободно помещается в 12 ГБ.
+    конструкторе. По умолчанию fp16 на CUDA.
     """
 
     def __init__(
@@ -56,9 +61,11 @@ class E5Encoder:
         use_fp16: bool = True,
         query_prefix: str = "query: ",
         passage_prefix: str = "passage: ",
+        pooling: str = "mean",
+        model_class: str = "auto",
     ) -> None:
         import torch
-        from transformers import AutoModel, AutoTokenizer
+        from transformers import AutoTokenizer
 
         self._torch = torch
         self.model_name = model_name
@@ -68,23 +75,32 @@ class E5Encoder:
         self.use_fp16 = use_fp16 and self.device.startswith("cuda")
         self.query_prefix = query_prefix
         self.passage_prefix = passage_prefix
+        self.pooling = pooling
+        self.model_class = model_class
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         dtype = torch.float16 if self.use_fp16 else torch.float32
-        self.model = AutoModel.from_pretrained(model_name, torch_dtype=dtype).to(self.device).eval()
-        self.dim = int(self.model.config.hidden_size)
+        if model_class == "t5_encoder":
+            from transformers import T5EncoderModel
+
+            self.model = T5EncoderModel.from_pretrained(model_name, torch_dtype=dtype).to(self.device).eval()
+        else:
+            from transformers import AutoModel
+
+            self.model = AutoModel.from_pretrained(model_name, torch_dtype=dtype).to(self.device).eval()
+        cfg = self.model.config
+        self.dim = int(getattr(cfg, "hidden_size", 0) or getattr(cfg, "d_model", 0))
         logger.info(
-            "E5Encoder: model=%s device=%s fp16=%s dim=%d max_len=%d",
-            model_name, self.device, self.use_fp16, self.dim, max_seq_len,
+            "E5Encoder: model=%s pooling=%s arch=%s device=%s fp16=%s dim=%d max_len=%d",
+            model_name, pooling, model_class, self.device, self.use_fp16, self.dim, max_seq_len,
         )
 
-    @staticmethod
-    def _average_pool(last_hidden, attention_mask):
-        # E5: усреднение по токенам с учётом маски (паддинг не влияет).
+    def _pool(self, last_hidden, attention_mask):
+        if self.pooling == "cls":
+            return last_hidden[:, 0]  # BGE-семейство: первый токен
+        # mean: усреднение по токенам с учётом маски (паддинг не влияет)
         mask = attention_mask.unsqueeze(-1).to(last_hidden.dtype)
-        summed = (last_hidden * mask).sum(dim=1)
-        counts = mask.sum(dim=1).clamp(min=1e-9)
-        return summed / counts
+        return (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
 
     def _encode(self, texts: Sequence[str], prefix: str) -> np.ndarray:
         torch = self._torch
@@ -95,8 +111,9 @@ class E5Encoder:
                 batch, max_length=self.max_seq_len, truncation=True, padding=True, return_tensors="pt"
             ).to(self.device)
             with torch.no_grad():
-                hidden = self.model(**enc).last_hidden_state
-                emb = self._average_pool(hidden, enc["attention_mask"])
+                # Только input_ids/attention_mask — совместимо и с XLM-R, и с T5.
+                hidden = self.model(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"]).last_hidden_state
+                emb = self._pool(hidden, enc["attention_mask"])
                 emb = torch.nn.functional.normalize(emb, p=2, dim=1)
             out.append(emb.float().cpu().numpy())
         return np.vstack(out).astype(np.float32) if out else np.zeros((0, self.dim), dtype=np.float32)
@@ -109,8 +126,8 @@ class E5Encoder:
 
     def info(self) -> dict[str, object]:
         return {
-            "type": "e5", "model": self.model_name, "device": self.device,
-            "fp16": self.use_fp16, "dim": self.dim, "max_seq_len": self.max_seq_len,
+            "type": "hf", "model": self.model_name, "pooling": self.pooling, "arch": self.model_class,
+            "device": self.device, "fp16": self.use_fp16, "dim": self.dim, "max_seq_len": self.max_seq_len,
         }
 
 

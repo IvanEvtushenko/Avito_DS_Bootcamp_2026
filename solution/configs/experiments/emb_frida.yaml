@@ -1,0 +1,17 @@
+# Ablation §7.3: эмбеддер ai-forever/FRIDA (T5-энкодер, префиксы search_query/search_document).
+# Пулинг уточняется по 1_Pooling/config.json модели перед прогоном.
+#   python3 -m support_search.cli all --experiment emb_frida.yaml
+artifacts_dir: artifacts_emb_frida
+retrievers:
+  dense:
+    model_name: ai-forever/FRIDA
+    model_class: t5_encoder
+    pooling: cls
+    query_prefix: "search_query: "
+    passage_prefix: "search_document: "
+reranker:
+  enabled: false
+ranking:
+  method: none
+export:
+  primary_source: fusion

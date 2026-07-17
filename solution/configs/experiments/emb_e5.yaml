@@ -1,0 +1,10 @@
+# Базовый эмбеддер e5-large в изолированном artifacts_dir — чтобы сравнить с
+# кандидатами §7.3 при одинаковом конфиге (candidate_top_k и т.п.).
+#   python3 -m support_search.cli all --experiment emb_e5.yaml
+artifacts_dir: artifacts_emb_e5
+reranker:
+  enabled: false
+ranking:
+  method: none
+export:
+  primary_source: fusion

@@ -22,6 +22,7 @@ from support_search.config import load_config  # noqa: E402
 from support_search.data.io import read_json  # noqa: E402
 from support_search.pipeline import (  # noqa: E402
     stage_evaluate,
+    stage_fuse,
     stage_make_answer,
     stage_make_folds,
     stage_preprocess,
@@ -42,7 +43,9 @@ class TestPipelineSmoke(unittest.TestCase):
             overrides=[
                 f"data.dir={self.data_dir}",
                 f"artifacts_dir={self.artifacts_dir}",
-                "retrievers.char_tfidf.min_df=1",  # min_df=2 отсечёт почти всё на 12 статьях
+                "retrievers.char_tfidf.min_df=1",   # min_df=2 отсечёт почти всё на 12 статьях
+                "retrievers.dense.enabled=false",   # smoke без модели/GPU: fusion над лексикой
+                "fusion.random_search.n_samples=50",
                 "evaluation.bootstrap_resamples=200",
                 "folds.holdout_frac=0.2",
             ],
@@ -70,7 +73,14 @@ class TestPipelineSmoke(unittest.TestCase):
         dev_bm25 = [r for r in report["rows"] if r["retriever"] == "bm25" and r["split"] == "dev"]
         self.assertTrue(dev_bm25 and dev_bm25[0]["map@10"] > 0.5)
 
-        answer_path = stage_make_answer(self.cfg)
+        # Слияние bm25 + char_tfidf (dense выключен) → матрица fusion + кандидаты.
+        stage_fuse(self.cfg)
+        self.assertTrue((self.artifacts_dir / "scores" / "fusion" / "test.npz").exists())
+        self.assertTrue((self.artifacts_dir / "candidates" / "test.parquet").exists())
+        fusion_report = read_json(self.artifacts_dir / "runs" / "fusion_report.json")
+        self.assertTrue(any(r["retriever"] == "fusion_weighted" for r in fusion_report["rows"]))
+
+        answer_path = stage_make_answer(self.cfg)  # primary_source=fusion
         content_first = answer_path.read_text(encoding="utf-8")
 
         # validate-answer не должен бросать исключение.

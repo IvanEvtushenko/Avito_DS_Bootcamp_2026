@@ -55,6 +55,25 @@ retrievers:
     min_df: 2
     sublinear_tf: true
     title_weight: 2.0
+  dense:                        # bi-encoder (этап 4). Чанкинг берётся из preprocess.chunking.
+    enabled: true
+    model_name: intfloat/multilingual-e5-large
+    device: null                # null → cuda, если доступна, иначе cpu
+    max_seq_len: 512
+    batch_size: 64
+    use_fp16: true
+    w_title: 0.5                # вклад косинуса заголовка (дешёвый параметр §4.3)
+    query_prefix: "query: "
+    passage_prefix: "passage: "
+
+fusion:                         # слияние кандидатов (этап 5)
+  enabled: true
+  method: weighted_sum          # weighted_sum | rrf
+  sources: null                 # null → все включённые ретриверы
+  rrf_k: 60                     # k для RRF-альтернативы
+  candidate_top_k: 50           # сколько кандидатов сохранять (потолок для реранкера)
+  random_search:
+    n_samples: 500              # ~сэмплов весов в совместном поиске (§4.3)
 
 evaluation:
   k: 10                         # MAP@k
@@ -64,6 +83,5 @@ evaluation:
 
 export:
   top_k: 10
-  # Какая матрица скоров формирует answer.csv на текущем этапе (лексический
-  # бейзлайн). Fusion/rerank подключатся на следующих этапах.
-  primary_source: bm25
+  # Какая матрица скоров формирует answer.csv. С этапа 5 — слияние.
+  primary_source: fusion

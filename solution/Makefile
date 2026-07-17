@@ -7,18 +7,20 @@ PYTHON ?= python3
 CONFIG ?= configs/default.yaml
 export PYTHONPATH := src
 
-.PHONY: help test preprocess folds retrieve evaluate answer validate baseline clean
+.PHONY: help test preprocess folds retrieve evaluate fuse answer validate baseline clean
 
 help:
 	@echo "Targets:"
 	@echo "  make test        - run unit + smoke tests (stdlib unittest, no GPU)"
 	@echo "  make preprocess  - clean HTML corpus -> artifacts/corpus"
 	@echo "  make folds       - dev/holdout split + 5-fold -> artifacts/splits"
-	@echo "  make retrieve    - run configured retrievers -> artifacts/scores"
+	@echo "  make retrieve    - run configured retrievers (incl. dense) -> artifacts/scores"
 	@echo "  make evaluate    - MAP@10 / recall@k on calibration -> artifacts/runs"
+	@echo "  make fuse        - min-max/RRF fusion + OOF weight search -> artifacts/scores/fusion"
 	@echo "  make answer      - build answer.csv for test.f -> artifacts/answers"
 	@echo "  make validate    - sanity-check answer.csv format"
-	@echo "  make baseline    - full chain: preprocess -> folds -> retrieve -> evaluate -> answer -> validate"
+	@echo "  make baseline    - full chain: preprocess -> folds -> retrieve -> evaluate -> fuse -> answer -> validate"
+	@echo "  (lexical-only, no GPU:  make baseline CONFIG=configs/default.yaml + --experiment lexical_only.yaml via cli)"
 
 test:
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
@@ -35,13 +37,16 @@ retrieve:
 evaluate:
 	$(PYTHON) -m support_search.cli evaluate --config $(CONFIG)
 
+fuse:
+	$(PYTHON) -m support_search.cli fuse --config $(CONFIG)
+
 answer:
 	$(PYTHON) -m support_search.cli make-answer --config $(CONFIG)
 
 validate:
 	$(PYTHON) -m support_search.cli validate-answer --config $(CONFIG)
 
-baseline: preprocess folds retrieve evaluate answer validate
+baseline: preprocess folds retrieve evaluate fuse answer validate
 
 clean:
-	rm -rf artifacts/corpus artifacts/splits artifacts/scores artifacts/runs artifacts/answers
+	rm -rf artifacts/corpus artifacts/splits artifacts/scores artifacts/runs artifacts/answers artifacts/candidates

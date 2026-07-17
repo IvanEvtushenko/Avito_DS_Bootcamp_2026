@@ -1,6 +1,7 @@
 # Artifacts are regenerated from data + config; never committed (see §5.1.6).
 artifacts/
 !artifacts/.gitkeep
+artifacts_*/          # изолированные каталоги ablation-экспериментов (напр. lexical_only)
 
 # Python
 __pycache__/

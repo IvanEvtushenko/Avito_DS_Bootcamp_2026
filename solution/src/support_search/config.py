@@ -22,7 +22,7 @@ from omegaconf import DictConfig, OmegaConf
 
 # Секции, без которых пайплайн не соберётся. Проверяются при загрузке, чтобы
 # ошибка конфига падала сразу, а не через десять стадий.
-REQUIRED_SECTIONS = ("data", "preprocess", "folds", "retrievers", "evaluation", "export")
+REQUIRED_SECTIONS = ("data", "preprocess", "folds", "retrievers", "fusion", "evaluation", "export")
 
 
 @dataclass(frozen=True)

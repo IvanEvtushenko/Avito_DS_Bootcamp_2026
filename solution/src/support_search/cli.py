@@ -15,6 +15,7 @@ from .config import load_config
 from .logging_utils import get_logger
 from .pipeline import (
     stage_evaluate,
+    stage_fuse,
     stage_make_answer,
     stage_make_folds,
     stage_preprocess,
@@ -47,6 +48,8 @@ def _run_stage(command: str, cfg, force: bool) -> None:
         stage_retrieve(cfg, force=force)
     elif command == "evaluate":
         stage_evaluate(cfg)
+    elif command == "fuse":
+        stage_fuse(cfg)
     elif command == "make-answer":
         stage_make_answer(cfg)
     elif command == "validate-answer":
@@ -56,6 +59,7 @@ def _run_stage(command: str, cfg, force: bool) -> None:
         stage_make_folds(cfg, force=force)
         stage_retrieve(cfg, force=force)
         stage_evaluate(cfg)
+        stage_fuse(cfg)
         stage_make_answer(cfg)
         stage_validate_answer(cfg)
     else:  # pragma: no cover - argparse не пропустит
@@ -66,7 +70,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     common = _common_parser()
     parser = argparse.ArgumentParser(prog="support-search", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for cmd in ["preprocess", "make-folds", "retrieve", "evaluate", "make-answer", "validate-answer", "all"]:
+    for cmd in ["preprocess", "make-folds", "retrieve", "evaluate", "fuse", "make-answer", "validate-answer", "all"]:
         sub.add_parser(cmd, parents=[common], help=f"стадия: {cmd}")
 
     args = parser.parse_args(argv)

@@ -1,0 +1,9 @@
+# Быстрый прогон без dense-модели: только лексика (BM25 + char-TF-IDF).
+# Не требует GPU и скачивания весов. Fusion сливает два лексических источника.
+#   python3 -m support_search.cli all --experiment lexical_only.yaml
+#
+# Отдельный artifacts_dir, чтобы не перетереть основной прогон (codestyle §14).
+artifacts_dir: artifacts_lexical
+retrievers:
+  dense:
+    enabled: false

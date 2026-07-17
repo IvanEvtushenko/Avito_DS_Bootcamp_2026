@@ -1,0 +1,56 @@
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# ── Тяжёлые регенерируемые артефакты (пересобираются из data+config через make) ──
+solution/artifacts/
+solution/artifacts_*/
+solution/model_archives/
+*.tar.zst
+*.safetensors
+
+# ── Логи экспериментов / черновые прогоны ───────────────
+solution/overnight_logs_*/
+solution/holdout_runs_*/
+solution/rerank_compare/
+solution/rerank_compare_ft/
+solution/*.log
+solution/synthetic_labeling/
+
+# ── Авторские заметки/описания — вне гита, на диске сохранены ──────────
+/README.md
+/PLAN.md
+/NEURAL_NETWORK_CODESTYLE.md
+/MAP_IMPROVEMENT_IDEAS.md
+solution/README.md
+solution/docs/
+solution/README_main.md
+solution/README_2.md
+solution/README_3.md
+solution/README_EMB.md
+solution/README_FT.md
+solution/README_DIAGNOSTICS.md
+solution/README_RERANKERS.md
+
+# ── Бэкап раздутого репозитория (удаляется вручную после пуша) ──────────
+.git_bloated_backup/
+
+# ── Локальный скратч / превью данных ────────────────────
+/fin.txt
+/articles.csv
+/test.csv
+/calibration_sample.csv
+/data_preview.ipynb
+
+# ── OS / editor ─────────────────────────────────────────
+.DS_Store

@@ -7,7 +7,7 @@ PYTHON ?= python3
 CONFIG ?= configs/default.yaml
 export PYTHONPATH := src
 
-.PHONY: help test preprocess folds retrieve evaluate fuse answer validate baseline clean
+.PHONY: help test preprocess folds retrieve evaluate fuse rerank blend answer validate baseline clean
 
 help:
 	@echo "Targets:"
@@ -40,13 +40,20 @@ evaluate:
 fuse:
 	$(PYTHON) -m support_search.cli fuse --config $(CONFIG)
 
+rerank:
+	$(PYTHON) -m support_search.cli rerank --config $(CONFIG)
+
+blend:
+	$(PYTHON) -m support_search.cli blend --config $(CONFIG)
+
 answer:
 	$(PYTHON) -m support_search.cli make-answer --config $(CONFIG)
 
 validate:
 	$(PYTHON) -m support_search.cli validate-answer --config $(CONFIG)
 
-baseline: preprocess folds retrieve evaluate fuse answer validate
+baseline: preprocess folds retrieve evaluate fuse rerank blend answer validate
 
 clean:
-	rm -rf artifacts/corpus artifacts/splits artifacts/scores artifacts/runs artifacts/answers artifacts/candidates
+	rm -rf artifacts/corpus artifacts/splits artifacts/scores artifacts/runs \
+	       artifacts/answers artifacts/candidates artifacts/models

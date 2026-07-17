@@ -7,3 +7,9 @@ artifacts_dir: artifacts_lexical
 retrievers:
   dense:
     enabled: false
+reranker:
+  enabled: false                # реранкеру нужны dense-пассажи → без dense выключен
+ranking:
+  method: none
+export:
+  primary_source: fusion        # без реранкера финал — слияние

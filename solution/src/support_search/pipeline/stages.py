@@ -31,6 +31,14 @@ from ..export import build_answer, validate_answer_file, write_answer
 from ..fusion import oof_fusion_search, reciprocal_rank_fusion, search_weights, weighted_sum
 from ..logging_utils import get_logger
 from ..preprocess import Tokenizer, chunk_text
+from ..ranking import blend_matrix, oof_blend, search_blend_weight
+from ..rerank import (
+    CrossEncoderReranker,
+    build_training_groups,
+    candidate_lists,
+    fine_tune_reranker,
+    rerank_to_matrix,
+)
 from ..retrievers import (
     RETRIEVER_REGISTRY,
     BM25Retriever,
@@ -48,6 +56,8 @@ SCHEMA_CORPUS = 2  # +chunks.parquet
 SCHEMA_SPLITS = 1
 SCHEMA_SCORES = 1
 SCHEMA_FUSION = 1
+SCHEMA_RERANK = 1
+SCHEMA_BLEND = 1
 
 
 # ─── общие помощники ─────────────────────────────────────────────────────
@@ -250,8 +260,18 @@ def stage_retrieve(cfg: Config, *, force: bool = False) -> Path:
 
         retriever = _build_retriever(cfg, name, tokenizer)
         retriever.fit(corpus)
-        cal_scores = retriever.score_matrix(calibration["query_text"].tolist(), calibration["query_id"].tolist())
-        test_scores = retriever.score_matrix(test["query_text"].tolist(), test["query_id"].tolist())
+        if isinstance(retriever, DenseRetriever):
+            # Кэшируем эмбеддинги запросов — их же использует реранкер для выбора
+            # лучшего чанка, без повторной загрузки E5 (этап 6).
+            q_cal = retriever.encode_queries(calibration["query_text"].tolist())
+            q_test = retriever.encode_queries(test["query_text"].tolist())
+            cal_scores = retriever.score_from_query_embeddings(q_cal, calibration["query_id"].tolist())
+            test_scores = retriever.score_from_query_embeddings(q_test, test["query_id"].tolist())
+            np.save(sd.path / "q_emb_calibration.npy", q_cal)
+            np.save(sd.path / "q_emb_test.npy", q_test)
+        else:
+            cal_scores = retriever.score_matrix(calibration["query_text"].tolist(), calibration["query_id"].tolist())
+            test_scores = retriever.score_matrix(test["query_text"].tolist(), test["query_id"].tolist())
         check_score_matrix(cal_scores, valid_ids)
         check_score_matrix(test_scores, valid_ids)
         cal_scores.save(sd.path / "calibration.npz")
@@ -455,6 +475,8 @@ def stage_fuse(cfg: Config) -> Path:
          "final_weights": final_weights, "fold_weights": {str(f): w for f, w in fold_weights.items()},
          "significance": significance, "rows": rows, "recall_at_50_oof": round(res_ws.recall_at_k.get(50, 0.0), 4)},
     )
+    # OOF per-query AP гибрида — для проверки значимости hybrid→rerank на этапе 7.
+    write_json(runs_dir / "fusion_oof_ap.json", {str(q): ap for q, ap in res_ws.per_query_ap.items()})
     _append_experiments(runs_dir / "experiments.csv", rows, config_hash, created_at)
 
     r50 = res_ws.recall_at_k.get(50, 0.0)
@@ -462,6 +484,233 @@ def stage_fuse(cfg: Config) -> Path:
         "fuse: OOF recall@%d=%.3f (потолок реранкера) — %s",
         top_c, r50, "OK ≥0.97" if r50 >= 0.97 else "ниже 0.97, см. план §5 (расширить кандидатов)",
     )
+    return sd.path
+
+
+# ─── стадия: реранкер (cross-encoder) ────────────────────────────────────
+def _texts_in_order(df: pd.DataFrame, query_ids) -> list[str]:
+    lookup = dict(zip(df["query_id"].tolist(), df["query_text"].tolist()))
+    return [str(lookup[int(q)]) for q in query_ids]
+
+
+def _reorder_rows(rows: np.ndarray, source_ids, target_ids) -> np.ndarray:
+    row_of = {int(q): i for i, q in enumerate(source_ids)}
+    return rows[[row_of[int(q)] for q in target_ids]]
+
+
+def _free_cuda() -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # pragma: no cover - torch может отсутствовать
+        pass
+
+
+def stage_rerank(cfg: Config, *, force: bool = False) -> Path:
+    """Cross-encoder reranker над топ-K кандидатов: zero-shot и (опц.) fine-tune."""
+    rr = cfg.section("reranker")
+    if not bool(rr.enabled):
+        raise ValueError("reranker.enabled=false — стадия rerank отключена")
+    top_k = int(rr.candidate_top_k)
+    scores_dir = stage_dir(cfg, "scores")
+
+    fusion_cal = ScoreMatrix.load(_require(scores_dir / "fusion" / "calibration.npz", "fuse"))
+    fusion_test = ScoreMatrix.load(_require(scores_dir / "fusion" / "test.npz", "fuse"))
+    dense_index = _require(scores_dir / "dense" / "index" / "meta.json", "retrieve").parent
+    dense = DenseRetriever.load(dense_index, encoder=None)
+    q_cal = np.load(_require(scores_dir / "dense" / "q_emb_calibration.npy", "retrieve"))
+    q_test = np.load(scores_dir / "dense" / "q_emb_test.npy")
+
+    cal = load_calibration(cfg)
+    test = load_test(cfg)
+    gt = parse_ground_truth(cal)
+    article_ids = fusion_cal.article_ids
+    splits = _load_splits(cfg)
+    gt_dev = {q: gt[q] for q in splits.dev}
+    eval_cfg = cfg.section("evaluation")
+    k = int(eval_cfg.k)
+    recall_ks = [int(x) for x in eval_cfg.recall_ks]
+    depth = max(recall_ks + [k])
+    ci_kw = dict(n_resamples=int(eval_cfg.bootstrap_resamples), ci=float(eval_cfg.ci), seed=cfg.seed)
+
+    # Всё — в порядке строк fusion-матрицы (канонический порядок запросов).
+    qtext_cal = _texts_in_order(cal, fusion_cal.query_ids)
+    qtext_test = _texts_in_order(test, fusion_test.query_ids)
+    q_cal_f = _reorder_rows(q_cal, cal["query_id"].to_numpy(), fusion_cal.query_ids)
+    q_test_f = _reorder_rows(q_test, test["query_id"].to_numpy(), fusion_test.query_ids)
+    cand_cal = candidate_lists(fusion_cal, top_k)
+    cand_test = candidate_lists(fusion_test, top_k)
+    pass_cal = dense.best_chunk_texts(q_cal_f, cand_cal)
+    pass_test = dense.best_chunk_texts(q_test_f, cand_test)
+
+    # --- Zero-shot ---
+    device = rr.get("device", None)
+    reranker = CrossEncoderReranker(
+        str(rr.model_name), device=str(device) if device else None,
+        max_length=int(rr.max_length), batch_size=int(rr.batch_size), use_fp16=bool(rr.use_fp16),
+    )
+    zs_cal = rerank_to_matrix(reranker, qtext_cal, fusion_cal.query_ids, article_ids, cand_cal, pass_cal, source="reranker_zs")
+    zs_test = rerank_to_matrix(reranker, qtext_test, fusion_test.query_ids, article_ids, cand_test, pass_test, source="reranker_zs")
+    del reranker
+    _free_cuda()
+
+    rows: list[dict] = []
+    res_zs = evaluate(zs_cal.rankings(depth), gt_dev, name="reranker_zs/dev_oof", k=k, recall_ks=recall_ks).compute_ci(**ci_kw)
+    rows.append({"retriever": "reranker_zs", "split": "dev_oof", **res_zs.to_row()})
+    logger.info(res_zs.summary())
+
+    chosen_cal, chosen_test, chosen = zs_cal, zs_test, "zero_shot"
+    res_ft = None
+
+    # --- Fine-tune (по фолдам, честный OOF) ---
+    ft_cfg = rr.fine_tune
+    if bool(ft_cfg.enabled):
+        n_neg = int(ft_cfg.n_negatives)
+        qtext_by_qid = {int(q): qtext_cal[i] for i, q in enumerate(fusion_cal.query_ids)}
+        cand_by_qid = {int(q): cand_cal[i] for i, q in enumerate(fusion_cal.query_ids)}
+        union_lists = [sorted(set(cand_cal[i]) | gt.get(int(q), set())) for i, q in enumerate(fusion_cal.query_ids)]
+        union_pass = dense.best_chunk_texts(q_cal_f, union_lists)
+        passage_of = {
+            (int(q), int(a)): union_pass[i][j]
+            for i, q in enumerate(fusion_cal.query_ids) for j, a in enumerate(union_lists[i])
+        }
+
+        row_of = {int(q): i for i, q in enumerate(fusion_cal.query_ids)}
+        oof_scores = np.full_like(zs_cal.scores, fill_value=zs_cal.scores.min())
+        test_accum = np.zeros_like(zs_test.scores)
+        models_dir = stage_dir(cfg, "models", subdir="reranker_ft")
+        for fold in range(splits.n_splits):
+            groups = build_training_groups(
+                splits.train_ids(fold), qtext_by_qid, gt, cand_by_qid, passage_of, n_negatives=n_neg
+            )
+            logger.info("fine-tune fold %d: %d обучающих групп", fold, len(groups))
+            fold_dir = fine_tune_reranker(
+                str(rr.model_name), groups, models_dir / f"fold_{fold}",
+                epochs=int(ft_cfg.epochs), lr=float(ft_cfg.lr), batch_groups=int(ft_cfg.batch_groups),
+                max_length=int(ft_cfg.max_length), use_fp16=bool(rr.use_fp16),
+                device=str(device) if device else None, seed=cfg.seed + fold,
+            )
+            fold_model = CrossEncoderReranker(
+                fold_dir, device=str(device) if device else None,
+                max_length=int(rr.max_length), batch_size=int(rr.batch_size), use_fp16=bool(rr.use_fp16),
+            )
+            val_ids = splits.fold(fold)
+            val_matrix = rerank_to_matrix(
+                fold_model, [qtext_by_qid[q] for q in val_ids], val_ids, article_ids,
+                [cand_by_qid[q] for q in val_ids], [pass_cal[row_of[q]] for q in val_ids], source="reranker_ft",
+            )
+            for i, q in enumerate(val_ids):
+                oof_scores[row_of[q]] = val_matrix.scores[i]
+            test_matrix = rerank_to_matrix(
+                fold_model, qtext_test, fusion_test.query_ids, article_ids, cand_test, pass_test, source="reranker_ft"
+            )
+            test_accum += test_matrix.scores
+            del fold_model
+            _free_cuda()
+
+        ft_cal = ScoreMatrix(fusion_cal.query_ids, article_ids, oof_scores, "reranker_ft")
+        ft_test = ScoreMatrix(fusion_test.query_ids, article_ids, test_accum / splits.n_splits, "reranker_ft")
+        res_ft = evaluate(ft_cal.rankings(depth), gt_dev, name="reranker_ft/dev_oof", k=k, recall_ks=recall_ks).compute_ci(**ci_kw)
+        rows.append({"retriever": "reranker_ft", "split": "dev_oof", **res_ft.to_row()})
+        logger.info(res_ft.summary())
+        # Фолбэк (§6): FT берём, только если он бьёт zero-shot по OOF MAP@10.
+        if res_ft.map_at_k > res_zs.map_at_k:
+            chosen_cal, chosen_test, chosen = ft_cal, ft_test, "fine_tune"
+        else:
+            logger.info("FT (%.4f) не бьёт zero-shot (%.4f) — остаёмся на zero-shot (§6 фолбэк)",
+                        res_ft.map_at_k, res_zs.map_at_k)
+
+    # Канонический выход реранкера (его читает blend).
+    sd = StageDir(
+        cfg, "scores", stage_dir(cfg, "scores", subdir="reranker"), SCHEMA_RERANK,
+        config_sections=("reranker", "fusion", "retrievers", "preprocess"),
+        input_hashes=_data_hashes(cfg, "articles", "calibration", "test"),
+    )
+    chosen_cal.save(sd.path / "calibration.npz")
+    chosen_test.save(sd.path / "test.npz")
+    sd.write_manifest(chosen=chosen, candidate_top_k=top_k,
+                      zero_shot_map=round(res_zs.map_at_k, 4),
+                      fine_tune_map=round(res_ft.map_at_k, 4) if res_ft else None)
+
+    runs_dir = stage_dir(cfg, "runs")
+    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    config_hash = cfg.hash_section("reranker", "fusion", "retrievers", "preprocess")
+    write_json(runs_dir / "rerank_report.json",
+               {"created_at": created_at, "config_hash": config_hash, "chosen": chosen, "rows": rows})
+    _append_experiments(runs_dir / "experiments.csv", rows, config_hash, created_at)
+    logger.info("rerank: выбран %s → scores/reranker/", chosen)
+    return sd.path
+
+
+def _require(path: Path, produced_by: str) -> Path:
+    if not path.exists():
+        raise FileNotFoundError(f"нет {path} — сначала запустите `{produced_by}`")
+    return path
+
+
+# ─── стадия: финальный блэнд ─────────────────────────────────────────────
+def stage_blend(cfg: Config) -> Path:
+    """blend(fusion, reranker) с честным OOF-подбором веса → финальная матрица."""
+    scores_dir = stage_dir(cfg, "scores")
+    fusion_cal = ScoreMatrix.load(_require(scores_dir / "fusion" / "calibration.npz", "fuse"))
+    fusion_test = ScoreMatrix.load(scores_dir / "fusion" / "test.npz")
+    reranker_cal = ScoreMatrix.load(_require(scores_dir / "reranker" / "calibration.npz", "rerank"))
+    reranker_test = ScoreMatrix.load(scores_dir / "reranker" / "test.npz")
+
+    gt = parse_ground_truth(load_calibration(cfg))
+    splits = _load_splits(cfg)
+    gt_dev = {q: gt[q] for q in splits.dev}
+    eval_cfg = cfg.section("evaluation")
+    k = int(eval_cfg.k)
+    recall_ks = [int(x) for x in eval_cfg.recall_ks]
+    depth = max(recall_ks + [k])
+    grid = int(cfg.section("ranking").weight_grid)
+    ci_kw = dict(n_resamples=int(eval_cfg.bootstrap_resamples), ci=float(eval_cfg.ci), seed=cfg.seed)
+
+    oof, fold_weights = oof_blend(fusion_cal, reranker_cal, gt, splits, k=k, depth=depth, grid=grid)
+    res = evaluate(oof, gt_dev, name="blend/dev_oof", k=k, recall_ks=recall_ks).compute_ci(**ci_kw)
+    logger.info(res.summary())
+
+    # Значимость hybrid→rerank: blend против OOF-гибрида (per-query AP из этапа 5).
+    significance = {}
+    fusion_ap_path = stage_dir(cfg, "runs") / "fusion_oof_ap.json"
+    if fusion_ap_path.exists():
+        fusion_ap = {int(q): float(v) for q, v in read_json(fusion_ap_path).items()}
+        common = sorted(set(res.per_query_ap) & set(fusion_ap))
+        p = paired_permutation_test(
+            np.array([res.per_query_ap[q] for q in common]),
+            np.array([fusion_ap[q] for q in common]), seed=cfg.seed,
+        )
+        significance["blend_vs_fusion"] = round(p, 4)
+        logger.info("значимость dev blend vs fusion: p=%.4f", p)
+
+    final_weight = search_blend_weight(fusion_cal, reranker_cal, gt, splits.dev, k=k, grid=grid)
+    final_cal = blend_matrix(fusion_cal, reranker_cal, weight=final_weight)
+    final_test = blend_matrix(fusion_test, reranker_test, weight=final_weight)
+    logger.info("итоговый вес блэнда (dev): fusion=%.2f reranker=%.2f", final_weight, 1 - final_weight)
+
+    sd = StageDir(
+        cfg, "scores", stage_dir(cfg, "scores", subdir="blend"), SCHEMA_BLEND,
+        config_sections=("ranking", "reranker", "fusion", "retrievers", "preprocess"),
+        input_hashes=_data_hashes(cfg, "articles", "calibration", "test"),
+    )
+    check_score_matrix(final_cal, fusion_cal.article_ids)
+    check_score_matrix(final_test, fusion_test.article_ids)
+    final_cal.save(sd.path / "calibration.npz")
+    final_test.save(sd.path / "test.npz")
+    sd.write_manifest(weight_fusion=round(final_weight, 4), fold_weights={str(f): round(w, 4) for f, w in fold_weights.items()},
+                      oof_map=round(res.map_at_k, 4))
+
+    runs_dir = stage_dir(cfg, "runs")
+    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    config_hash = cfg.hash_section("ranking", "reranker", "fusion", "retrievers", "preprocess")
+    rows = [{"retriever": "blend", "split": "dev_oof", **res.to_row()}]
+    write_json(runs_dir / "blend_report.json",
+               {"created_at": created_at, "config_hash": config_hash, "weight_fusion": final_weight,
+                "significance": significance, "rows": rows})
+    _append_experiments(runs_dir / "experiments.csv", rows, config_hash, created_at)
     return sd.path
 
 

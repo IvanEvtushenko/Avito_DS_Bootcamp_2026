@@ -45,6 +45,8 @@ class TestPipelineSmoke(unittest.TestCase):
                 f"artifacts_dir={self.artifacts_dir}",
                 "retrievers.char_tfidf.min_df=1",   # min_df=2 отсечёт почти всё на 12 статьях
                 "retrievers.dense.enabled=false",   # smoke без модели/GPU: fusion над лексикой
+                "reranker.enabled=false",           # реранкеру нужен dense — выключен
+                "export.primary_source=fusion",
                 "fusion.random_search.n_samples=50",
                 "evaluation.bootstrap_resamples=200",
                 "folds.holdout_frac=0.2",

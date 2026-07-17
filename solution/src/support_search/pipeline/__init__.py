@@ -7,11 +7,13 @@ from __future__ import annotations
 
 from .artifacts import StageDir, hash_file, is_fresh, stage_dir, write_manifest
 from .stages import (
+    stage_blend,
     stage_evaluate,
     stage_fuse,
     stage_make_answer,
     stage_make_folds,
     stage_preprocess,
+    stage_rerank,
     stage_retrieve,
     stage_validate_answer,
 )
@@ -27,6 +29,8 @@ __all__ = [
     "stage_retrieve",
     "stage_evaluate",
     "stage_fuse",
+    "stage_rerank",
+    "stage_blend",
     "stage_make_answer",
     "stage_validate_answer",
 ]

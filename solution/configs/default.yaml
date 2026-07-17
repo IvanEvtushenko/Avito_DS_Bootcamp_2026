@@ -75,6 +75,26 @@ fusion:                         # слияние кандидатов (этап 
   random_search:
     n_samples: 500              # ~сэмплов весов в совместном поиске (§4.3)
 
+reranker:                       # cross-encoder reranker (этап 6)
+  enabled: true
+  model_name: BAAI/bge-reranker-v2-m3
+  device: null                  # null → cuda, если доступна
+  max_length: 512
+  batch_size: 64
+  use_fp16: true
+  candidate_top_k: 50           # сколько кандидатов fusion переоценивать
+  fine_tune:                    # zero-shot по умолчанию; FT сравнивается по OOF (§6, фолбэк)
+    enabled: false
+    epochs: 2
+    lr: 2.0e-5
+    batch_groups: 4
+    n_negatives: 7
+    max_length: 384
+
+ranking:                        # финальное ранжирование (этап 7)
+  method: blend                 # blend(fusion_score, reranker_score)
+  weight_grid: 51               # размер сетки поиска веса бленда
+
 evaluation:
   k: 10                         # MAP@k
   recall_ks: [10, 20, 50, 100]
@@ -83,5 +103,5 @@ evaluation:
 
 export:
   top_k: 10
-  # Какая матрица скоров формирует answer.csv. С этапа 5 — слияние.
-  primary_source: fusion
+  # Какая матрица скоров формирует answer.csv. С этапа 7 — финальный блэнд.
+  primary_source: blend

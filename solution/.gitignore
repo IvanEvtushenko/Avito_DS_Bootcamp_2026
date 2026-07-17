@@ -1,0 +1,19 @@
+# Artifacts are regenerated from data + config; never committed (see §5.1.6).
+artifacts/
+!artifacts/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/

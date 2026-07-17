@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "support-search"
+version = "0.1.0"
+description = "Retrieval of Avito help articles for a user question (RAG retrieval stage, MAP@10)."
+requires-python = ">=3.10"
+# Runtime dependencies for the lexical baseline (stages 1-3). Optional heavier
+# stacks (dense retrieval, reranker) live in requirements.txt extras so that the
+# baseline stays installable and reproducible on a minimal environment.
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+    "pyarrow",
+    "beautifulsoup4",
+    "lxml",
+    "omegaconf",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+# Optional lexical improvements: Russian lemmatization / tokenization. The code
+# auto-detects these at runtime and falls back gracefully when they are absent.
+lexical = ["pymorphy3", "pymorphy3-dicts-ru", "razdel"]
+# Later stages (not part of the stage 1-3 baseline).
+dense = ["sentence-transformers", "torch", "transformers"]
+
+[project.scripts]
+support-search = "support_search.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Tests run under stdlib unittest (see Makefile). Config kept for when pytest is
+# available in the environment.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

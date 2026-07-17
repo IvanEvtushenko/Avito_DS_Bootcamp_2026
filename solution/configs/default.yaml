@@ -1,0 +1,69 @@
+# Полный конфиг решения, разбитый по секциям (план §5.1). Компоненты получают
+# только свою секцию — случайное изменение чужого параметра не инвалидирует все
+# кэши. Ablation-конфиги в configs/experiments/ переопределяют отдельные ключи.
+
+seed: 42
+
+data:
+  dir: ../candidate_data        # относительно корня проекта (solution/)
+  articles: articles.f
+  calibration: calibration.f
+  test: test.f
+
+preprocess:
+  html:
+    # Теги, у которых нет полезного для поиска текста; остальное (таблицы,
+    # спойлеры/вкладки=label, списки, анкоры ссылок) сохраняется.
+    drop_tags: [script, style, input, img, svg, button]
+  normalize:
+    lemmatizer: auto            # auto | pymorphy3 | none  (auto = pymorphy3 если установлен)
+    tokenizer: auto             # auto | razdel | regex
+    min_len: 2
+    use_stopwords: true
+    # Плейсхолдеры есть только в запросах, в статьях их нет (EDA). Значение =
+    # слово-замена для лексического сигнала; "" = выбросить токен. Это дешёвая
+    # ablation-развилка (план §6, этап 2).
+    placeholders:
+      "<MONEY>": деньги
+      "<DATE>": дата
+      "<PHONE>": телефон
+      "<URL>": ссылка
+      "<ID>": ""
+  chunking:
+    max_tokens: 400
+    overlap: 100
+    max_chunks_per_article: 40  # защита от статьи на 901К символов (план §8)
+    title_prefix: true
+
+folds:
+  n_splits: 5
+  holdout_frac: 0.2
+  stratify_by: gt_count         # число GT-статей: 1 / 2 / 3+
+  seed: 42
+
+retrievers:
+  document_field: full          # full | chunks — представление статьи для лексики
+  bm25:
+    enabled: true
+    k1: 1.5
+    b: 0.75
+    title_weight: 2.0           # BM25F-lite: вес поля title (дешёвый параметр §4.3)
+  char_tfidf:
+    enabled: true
+    ngram_min: 3
+    ngram_max: 5
+    min_df: 2
+    sublinear_tf: true
+    title_weight: 2.0
+
+evaluation:
+  k: 10                         # MAP@k
+  recall_ks: [10, 20, 50, 100]
+  bootstrap_resamples: 10000
+  ci: 0.95
+
+export:
+  top_k: 10
+  # Какая матрица скоров формирует answer.csv на текущем этапе (лексический
+  # бейзлайн). Fusion/rerank подключатся на следующих этапах.
+  primary_source: bm25

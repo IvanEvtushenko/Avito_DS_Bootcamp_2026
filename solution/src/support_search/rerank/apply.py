@@ -40,29 +40,45 @@ def build_passages_from_qemb(
     return dense.best_chunk_texts(query_embeddings, cand_lists)
 
 
+def _as_chunks(passage: str | Sequence[str]) -> list[str]:
+    """Пассаж кандидата → список чанков (строка = один чанк)."""
+    return [passage] if isinstance(passage, str) else list(passage)
+
+
 def rerank_to_matrix(
     reranker: Reranker,
     query_texts: Sequence[str],
     query_ids: Sequence[int],
     article_ids: np.ndarray,
     cand_lists: Sequence[Sequence[int]],
-    passages: Sequence[Sequence[str]],
+    passages: Sequence[Sequence[str | Sequence[str]]],
     *,
     source: str = "reranker",
 ) -> ScoreMatrix:
-    """Оценить все пары (запрос, кандидат) и разложить логиты в матрицу [Q, A]."""
+    """Оценить все пары (запрос, кандидат) и разложить логиты в матрицу [Q, A].
+
+    Пассаж кандидата — строка (один чанк) или список чанков: тогда скор статьи =
+    max по её чанкам (идея №3 MAP_IMPROVEMENT_IDEAS — не наследовать ошибку
+    единственного чанка, выбранного dense-моделью).
+    """
     col_of = {int(a): j for j, a in enumerate(article_ids)}
     scores = np.full((len(query_ids), len(article_ids)), NON_CANDIDATE, dtype=np.float32)
 
     # Листовой реранкер (напр. jina): запрос и весь его список кандидатов — вместе,
-    # по-запросно, а не одной сплющенной пачкой пар.
+    # по-запросно, а не одной сплющенной пачкой пар. Чанки статьи входят в тот же
+    # листовой контекст, скор статьи — max по её чанкам.
     if hasattr(reranker, "score_listwise"):
         for i, (cands, passs) in enumerate(zip(cand_lists, passages)):
             if not cands:
                 continue
-            row_scores = reranker.score_listwise(query_texts[i], list(passs))
-            for aid, s in zip(cands, row_scores):
-                scores[i, col_of[int(aid)]] = float(s)
+            chunk_lists = [_as_chunks(p) for p in passs]
+            flat = [c for chunks in chunk_lists for c in chunks]
+            flat_scores = reranker.score_listwise(query_texts[i], flat)
+            pos = 0
+            for aid, chunks in zip(cands, chunk_lists):
+                j = col_of[int(aid)]
+                scores[i, j] = float(np.max(flat_scores[pos : pos + len(chunks)]))
+                pos += len(chunks)
         return ScoreMatrix(query_ids=np.asarray(query_ids), article_ids=np.asarray(article_ids), scores=scores, source=source)
 
     flat_queries: list[str] = []
@@ -70,12 +86,13 @@ def rerank_to_matrix(
     positions: list[tuple[int, int]] = []
     for i, (cands, passs) in enumerate(zip(cand_lists, passages)):
         for aid, passage in zip(cands, passs):
-            flat_queries.append(query_texts[i])
-            flat_passages.append(passage)
-            positions.append((i, col_of[int(aid)]))
+            for chunk in _as_chunks(passage):
+                flat_queries.append(query_texts[i])
+                flat_passages.append(chunk)
+                positions.append((i, col_of[int(aid)]))
 
     if flat_queries:
         pair_scores = reranker.score_pairs(flat_queries, flat_passages)
         for (i, j), s in zip(positions, pair_scores):
-            scores[i, j] = float(s)
+            scores[i, j] = max(scores[i, j], float(s))  # max по чанкам статьи
     return ScoreMatrix(query_ids=np.asarray(query_ids), article_ids=np.asarray(article_ids), scores=scores, source=source)

@@ -559,6 +559,42 @@ def _free_cuda() -> None:
         pass
 
 
+def _synthetic_training_groups(cfg: Config, ft_cfg, *, n_negatives: int) -> list:
+    """Обучающие группы реранкера из синтетических запросов (идея №1 MAP_IMPROVEMENT_IDEAS).
+
+    CSV формата calibration (query_id, query_text, ground_truth). Позитив — GT-статья
+    синтетического запроса; хард-негативы — верх dense-выдачи по этому запросу
+    (GT исключается внутри build_training_groups). Пассаж — лучший dense-чанк.
+    Разметка calibration в обучении не участвует → одна модель честна для dev OOF.
+    """
+    path = cfg.resolve(str(ft_cfg.synthetic_path))
+    df = pd.read_csv(path)
+    gt = parse_ground_truth(df)
+    qids = [int(q) for q in df["query_id"]]
+    qtext_of = {int(q): str(t) for q, t in zip(df["query_id"], df["query_text"])}
+
+    encoder = _build_encoder(cfg)
+    dense = DenseRetriever.load(stage_dir(cfg, "scores") / "dense" / "index", encoder=encoder)
+    # GT вне корпуса (не должно случаться) не роняет пайплайн, а выпадает из групп.
+    known = {int(a) for a in dense.article_ids}
+    gt = {q: {a for a in arts if int(a) in known} for q, arts in gt.items()}
+
+    q_emb = dense.encode_queries([qtext_of[q] for q in qids])
+    mine_top_k = int(ft_cfg.get("mine_top_k", 30))
+    ranked = dense.score_from_query_embeddings(q_emb, qids).rankings(mine_top_k)
+
+    union_lists = [sorted(set(ranked[q]) | gt.get(q, set())) for q in qids]
+    union_pass = dense.best_chunk_texts(q_emb, union_lists)
+    passage_of = {
+        (q, int(a)): union_pass[i][j]
+        for i, q in enumerate(qids) for j, a in enumerate(union_lists[i])
+    }
+    groups = build_training_groups(qids, qtext_of, gt, {q: ranked[q] for q in qids}, passage_of, n_negatives=n_negatives)
+    del dense, encoder
+    _free_cuda()
+    return groups
+
+
 def stage_rerank(cfg: Config, *, force: bool = False) -> Path:
     """Cross-encoder reranker над топ-K кандидатов: zero-shot и (опц.) fine-tune."""
     rr = cfg.section("reranker")
@@ -593,8 +629,15 @@ def stage_rerank(cfg: Config, *, force: bool = False) -> Path:
     q_test_f = _reorder_rows(q_test, test["query_id"].to_numpy(), fusion_test.query_ids)
     cand_cal = candidate_lists(fusion_cal, top_k)
     cand_test = candidate_lists(fusion_test, top_k)
-    pass_cal = dense.best_chunk_texts(q_cal_f, cand_cal)
-    pass_test = dense.best_chunk_texts(q_test_f, cand_test)
+    m_chunks = int(rr.get("chunks_per_article", 1))
+    if m_chunks > 1:
+        # Идея №3 (MAP_IMPROVEMENT_IDEAS): реранкер скорит топ-m чанков статьи,
+        # скор статьи = max — не наследуем ошибку единственного dense-чанка.
+        pass_cal = dense.top_chunk_texts(q_cal_f, cand_cal, m_chunks)
+        pass_test = dense.top_chunk_texts(q_test_f, cand_test, m_chunks)
+    else:
+        pass_cal = dense.best_chunk_texts(q_cal_f, cand_cal)
+        pass_test = dense.best_chunk_texts(q_test_f, cand_test)
 
     # --- Zero-shot ---
     device = rr.get("device", None)
@@ -613,7 +656,7 @@ def stage_rerank(cfg: Config, *, force: bool = False) -> Path:
     chosen_cal, chosen_test, chosen = zs_cal, zs_test, "zero_shot"
     res_ft = None
 
-    # --- Fine-tune (по фолдам, честный OOF) ---
+    # --- Fine-tune: data=labeled (по фолдам, честный OOF) | data=synthetic (одна модель) ---
     ft_cfg = rr.fine_tune
     if bool(ft_cfg.enabled):
         # FT реализован только для cross-encoder head (bge). Для causal-LM/listwise/GGUF
@@ -621,50 +664,73 @@ def stage_rerank(cfg: Config, *, force: bool = False) -> Path:
         if backend != "sequence_classification":
             raise ValueError(f"reranker.fine_tune не поддержан для backend={backend!r} (только sequence_classification)")
         n_neg = int(ft_cfg.n_negatives)
-        qtext_by_qid = {int(q): qtext_cal[i] for i, q in enumerate(fusion_cal.query_ids)}
-        cand_by_qid = {int(q): cand_cal[i] for i, q in enumerate(fusion_cal.query_ids)}
-        union_lists = [sorted(set(cand_cal[i]) | gt.get(int(q), set())) for i, q in enumerate(fusion_cal.query_ids)]
-        union_pass = dense.best_chunk_texts(q_cal_f, union_lists)
-        passage_of = {
-            (int(q), int(a)): union_pass[i][j]
-            for i, q in enumerate(fusion_cal.query_ids) for j, a in enumerate(union_lists[i])
-        }
-
-        row_of = {int(q): i for i, q in enumerate(fusion_cal.query_ids)}
-        oof_scores = np.full_like(zs_cal.scores, fill_value=zs_cal.scores.min())
-        test_accum = np.zeros_like(zs_test.scores)
+        ft_data = str(ft_cfg.get("data", "labeled"))  # labeled | synthetic
+        tune_kw = dict(
+            epochs=int(ft_cfg.epochs), lr=float(ft_cfg.lr), batch_groups=int(ft_cfg.batch_groups),
+            max_length=int(ft_cfg.max_length), use_fp16=bool(rr.use_fp16),
+            freeze_embeddings=bool(ft_cfg.get("freeze_embeddings", True)),
+            schedule=str(ft_cfg.get("schedule", "constant")),
+            warmup_ratio=float(ft_cfg.get("warmup_ratio", 0.0)),
+            device=str(device) if device else None,
+        )
         models_dir = stage_dir(cfg, "models", subdir="reranker_ft")
-        for fold in range(splits.n_splits):
-            groups = build_training_groups(
-                splits.train_ids(fold), qtext_by_qid, gt, cand_by_qid, passage_of, n_negatives=n_neg
-            )
-            logger.info("fine-tune fold %d: %d обучающих групп", fold, len(groups))
-            fold_dir = fine_tune_reranker(
-                str(rr.model_name), groups, models_dir / f"fold_{fold}",
-                epochs=int(ft_cfg.epochs), lr=float(ft_cfg.lr), batch_groups=int(ft_cfg.batch_groups),
-                max_length=int(ft_cfg.max_length), use_fp16=bool(rr.use_fp16),
-                device=str(device) if device else None, seed=cfg.seed + fold,
-            )
-            fold_model = CrossEncoderReranker(
-                fold_dir, device=str(device) if device else None,
+
+        if ft_data == "synthetic":
+            # Обучение не видит разметку calibration → модель честно OOF для dev и test,
+            # фолды не нужны: одна модель, один инференс-проход.
+            groups = _synthetic_training_groups(cfg, ft_cfg, n_negatives=n_neg)
+            logger.info("fine-tune (synthetic): %d обучающих групп", len(groups))
+            model_dir = fine_tune_reranker(str(rr.model_name), groups, models_dir / "synthetic", seed=cfg.seed, **tune_kw)
+            ft_model = CrossEncoderReranker(
+                model_dir, device=str(device) if device else None,
                 max_length=int(rr.max_length), batch_size=int(rr.batch_size), use_fp16=bool(rr.use_fp16),
             )
-            val_ids = splits.fold(fold)
-            val_matrix = rerank_to_matrix(
-                fold_model, [qtext_by_qid[q] for q in val_ids], val_ids, article_ids,
-                [cand_by_qid[q] for q in val_ids], [pass_cal[row_of[q]] for q in val_ids], source="reranker_ft",
-            )
-            for i, q in enumerate(val_ids):
-                oof_scores[row_of[q]] = val_matrix.scores[i]
-            test_matrix = rerank_to_matrix(
-                fold_model, qtext_test, fusion_test.query_ids, article_ids, cand_test, pass_test, source="reranker_ft"
-            )
-            test_accum += test_matrix.scores
-            del fold_model
+            ft_cal = rerank_to_matrix(ft_model, qtext_cal, fusion_cal.query_ids, article_ids, cand_cal, pass_cal, source="reranker_ft")
+            ft_test = rerank_to_matrix(ft_model, qtext_test, fusion_test.query_ids, article_ids, cand_test, pass_test, source="reranker_ft")
+            del ft_model
             _free_cuda()
+        else:
+            qtext_by_qid = {int(q): qtext_cal[i] for i, q in enumerate(fusion_cal.query_ids)}
+            cand_by_qid = {int(q): cand_cal[i] for i, q in enumerate(fusion_cal.query_ids)}
+            union_lists = [sorted(set(cand_cal[i]) | gt.get(int(q), set())) for i, q in enumerate(fusion_cal.query_ids)]
+            union_pass = dense.best_chunk_texts(q_cal_f, union_lists)
+            passage_of = {
+                (int(q), int(a)): union_pass[i][j]
+                for i, q in enumerate(fusion_cal.query_ids) for j, a in enumerate(union_lists[i])
+            }
 
-        ft_cal = ScoreMatrix(fusion_cal.query_ids, article_ids, oof_scores, "reranker_ft")
-        ft_test = ScoreMatrix(fusion_test.query_ids, article_ids, test_accum / splits.n_splits, "reranker_ft")
+            row_of = {int(q): i for i, q in enumerate(fusion_cal.query_ids)}
+            oof_scores = np.full_like(zs_cal.scores, fill_value=zs_cal.scores.min())
+            test_accum = np.zeros_like(zs_test.scores)
+            for fold in range(splits.n_splits):
+                groups = build_training_groups(
+                    splits.train_ids(fold), qtext_by_qid, gt, cand_by_qid, passage_of, n_negatives=n_neg
+                )
+                logger.info("fine-tune fold %d: %d обучающих групп", fold, len(groups))
+                fold_dir = fine_tune_reranker(
+                    str(rr.model_name), groups, models_dir / f"fold_{fold}", seed=cfg.seed + fold, **tune_kw
+                )
+                fold_model = CrossEncoderReranker(
+                    fold_dir, device=str(device) if device else None,
+                    max_length=int(rr.max_length), batch_size=int(rr.batch_size), use_fp16=bool(rr.use_fp16),
+                )
+                val_ids = splits.fold(fold)
+                val_matrix = rerank_to_matrix(
+                    fold_model, [qtext_by_qid[q] for q in val_ids], val_ids, article_ids,
+                    [cand_by_qid[q] for q in val_ids], [pass_cal[row_of[q]] for q in val_ids], source="reranker_ft",
+                )
+                for i, q in enumerate(val_ids):
+                    oof_scores[row_of[q]] = val_matrix.scores[i]
+                test_matrix = rerank_to_matrix(
+                    fold_model, qtext_test, fusion_test.query_ids, article_ids, cand_test, pass_test, source="reranker_ft"
+                )
+                test_accum += test_matrix.scores
+                del fold_model
+                _free_cuda()
+
+            ft_cal = ScoreMatrix(fusion_cal.query_ids, article_ids, oof_scores, "reranker_ft")
+            ft_test = ScoreMatrix(fusion_test.query_ids, article_ids, test_accum / splits.n_splits, "reranker_ft")
+
         res_ft = evaluate(ft_cal.rankings(depth), gt_dev, name="reranker_ft/dev_oof", k=k, recall_ks=recall_ks).compute_ci(**ci_kw)
         rows.append({"retriever": "reranker_ft", "split": "dev_oof", **res_ft.to_row()})
         logger.info(res_ft.summary())
@@ -683,7 +749,8 @@ def stage_rerank(cfg: Config, *, force: bool = False) -> Path:
     )
     chosen_cal.save(sd.path / "calibration.npz")
     chosen_test.save(sd.path / "test.npz")
-    sd.write_manifest(chosen=chosen, candidate_top_k=top_k,
+    sd.write_manifest(chosen=chosen, candidate_top_k=top_k, chunks_per_article=m_chunks,
+                      fine_tune_data=str(ft_cfg.get("data", "labeled")) if bool(ft_cfg.enabled) else None,
                       zero_shot_map=round(res_zs.map_at_k, 4),
                       fine_tune_map=round(res_ft.map_at_k, 4) if res_ft else None)
 

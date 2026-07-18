@@ -1,7 +1,13 @@
 # Artifacts are regenerated from data + config; never committed (see §5.1.6).
 artifacts/
 !artifacts/.gitkeep
-artifacts_*/          # изолированные каталоги ablation-экспериментов (напр. lexical_only)
+# изолированные каталоги ablation-экспериментов (напр. lexical_only, artifacts_rr_*).
+# ВАЖНО: комментарий — только на отдельной строке; инлайн-# в .gitignore ломает паттерн.
+artifacts_*/
+# архивы весов моделей (гигабайты) — не в git
+model_archives/
+*.tar.zst
+*.safetensors
 
 # Python
 __pycache__/

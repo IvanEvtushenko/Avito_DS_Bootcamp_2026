@@ -100,6 +100,8 @@ reranker:                       # cross-encoder reranker (этап 6)
   batch_size: 64
   use_fp16: true
   candidate_top_k: 30           # сколько кандидатов fusion переоценивать
+  chunks_per_article: 40        # скор статьи = max по топ-m dense-чанкам; 40 = все чанки
+                                # (медиана 1, 83% статей <=3; стоимость vs top-3 всего x1.5)
   fine_tune:                    # zero-shot по умолчанию; FT сравнивается по OOF (§6, фолбэк)
     enabled: false
     epochs: 2

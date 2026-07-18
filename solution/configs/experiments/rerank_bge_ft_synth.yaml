@@ -1,0 +1,33 @@
+# FT-сценарий 2: дообучение bge-reranker-v2-m3 на СИНТЕТИКЕ (4775 doc2query-запросов,
+# идея №1 MAP_IMPROVEMENT_IDEAS). Разметка calibration в обучении не участвует →
+# одна модель (без фолдов), честный OOF на dev автоматически. Хард-негативы —
+# верх dense-выдачи по синтетическому запросу. Гиперпараметры как в labeled-сценарии.
+#   cd solution && PYTHONPATH=src HF_HUB_OFFLINE=1 python3 -m support_search.cli all --experiment rerank_bge_ft_synth.yaml
+artifacts_dir: artifacts_rr_bge_ft_synth
+fusion:
+  candidate_top_k: 50           # потолок кандидатов: R@50≈0.975 vs R@30≈0.958
+evaluation:
+  recall_ks: [10, 20, 50, 100]
+reranker:
+  enabled: true
+  backend: sequence_classification
+  model_name: BAAI/bge-reranker-v2-m3
+  revision: 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
+  max_length: 512
+  batch_size: 64
+  use_fp16: true
+  candidate_top_k: 50           # реранкер переоценивает весь топ-50 fusion
+  chunks_per_article: 40        # все чанки (max-pool); ночной прогон 2026-07-18 шёл с 3
+  fine_tune:
+    enabled: true
+    data: synthetic             # одна модель на всей синтетике
+    synthetic_path: synthetic_labeling/synthetic_questions.csv
+    mine_top_k: 30              # глубина dense-выдачи для майнинга хард-негативов
+    epochs: 2
+    lr: 1.0e-5
+    schedule: cosine
+    warmup_ratio: 0.1
+    batch_groups: 4
+    n_negatives: 7
+    max_length: 384
+    freeze_embeddings: true

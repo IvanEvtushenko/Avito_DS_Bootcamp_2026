@@ -126,6 +126,31 @@ class DenseRetriever(Retriever):
             out.append(row)
         return out
 
+    def top_chunk_texts(
+        self, query_embeddings: np.ndarray, article_id_lists: Sequence[Sequence[int]], m: int
+    ) -> list[list[list[str]]]:
+        """До m лучших по косинусу чанков на пару (запрос, статья-кандидат).
+
+        Обобщение `best_chunk_texts` для реранкера: скорить топ-m чанков и брать
+        max по скорам снимает зависимость от единственного выбора dense-модели
+        (идея №3 MAP_IMPROVEMENT_IDEAS). У коротких статей чанков может быть < m.
+        """
+        id_to_idx = {int(a): i for i, a in enumerate(self.article_ids)}
+        n_chunks = self.chunk_emb.shape[0]
+        out: list[list[list[str]]] = []
+        for q_i, article_ids in enumerate(article_id_lists):
+            q_vec = query_embeddings[q_i]
+            row: list[list[str]] = []
+            for aid in article_ids:
+                a = id_to_idx[int(aid)]
+                start = int(self.chunk_offsets[a])
+                end = int(self.chunk_offsets[a + 1]) if a + 1 < len(self.chunk_offsets) else n_chunks
+                sims = self.chunk_emb[start:end] @ q_vec
+                order = np.argsort(-sims)[:m]
+                row.append([self.chunk_texts[start + int(k)] for k in order])
+            out.append(row)
+        return out
+
     def save(self, path: str | Path) -> Path:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)

@@ -80,9 +80,15 @@ def check_zs() -> None:
     })
 
 
-def check_ft() -> None:
-    """Дообученная модель: среднее 5 фолд-моделей на holdout (как на test) + blend."""
-    cfg = load_config("configs/default.yaml", experiment="rerank_bge_ft_labeled.yaml")
+def check_ft(cfg=None) -> None:
+    """Дообученная модель: среднее 5 фолд-моделей на holdout (как на test) + blend.
+
+    cfg=None → архивный labeled-прогон; иначе — переданный конфиг (напр. победитель
+    свипа: load_config(..., overrides=["artifacts_dir=artifacts_rr_ft_k50"])). Блэнд —
+    plain (без граф-фич): быстрая проверка переноса реранкера на holdout.
+    """
+    if cfg is None:
+        cfg = load_config("configs/default.yaml", experiment="rerank_bge_ft_labeled.yaml")
     art = cfg.artifacts_dir
     manifest = json.loads((art / "scores" / "reranker" / "manifest.json").read_text())
     assert manifest["chosen"] == "fine_tune", "ожидали chosen=fine_tune в labeled-прогоне"
@@ -164,5 +170,10 @@ if __name__ == "__main__":
         check_zs()
     elif variant == "ft":
         check_ft()
+    elif variant == "ft_dir" and len(sys.argv) > 2:
+        # Подтверждение произвольного FT-прогона (напр. победителя свипа) на его
+        # holdout: plain blend, обращение логируется в holdout_log.json этого дира.
+        check_ft(load_config("configs/default.yaml", overrides=[f"artifacts_dir={sys.argv[2]}"]))
     else:
-        raise SystemExit("usage: holdout_check.py zs|ft  (каждый запуск = одно обращение к holdout!)")
+        raise SystemExit("usage: holdout_check.py zs|ft|ft_dir <artifacts_dir>  "
+                         "(каждый запуск = одно обращение к holdout!)")

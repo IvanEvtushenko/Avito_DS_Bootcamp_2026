@@ -28,6 +28,7 @@ from ..data.io import (
 from ..data.splits import Splits, make_splits
 from ..eval import evaluate, paired_permutation_test
 from ..export import build_answer, validate_answer_file, write_answer
+from ..features import GraphFeaturizer, article_vectors, link_adjacency
 from ..fusion import (
     fit_fusion_ltr,
     oof_fusion_ltr,
@@ -40,6 +41,7 @@ from ..fusion import (
 from ..logging_utils import get_logger
 from ..preprocess import Tokenizer, chunk_text
 from ..ranking import (
+    MLPRankerLTR,
     blend_matrix,
     fit_blend_ltr,
     oof_blend,
@@ -674,13 +676,34 @@ def stage_rerank(cfg: Config, *, force: bool = False) -> Path:
             device=str(device) if device else None,
         )
         models_dir = stage_dir(cfg, "models", subdir="reranker_ft")
+        # reuse_models: путь к готовым фолд-моделям (обученным раньше). Если задан —
+        # НЕ обучаем, а грузим и только прогоняем инференс. Так одну ночную тренировку
+        # можно переиспользовать под любую правку ретрива/препроцессинга (напр. лемматизация
+        # BM25): пассажи реранкера от неё не зависят, а фолды детерминированы (seed) →
+        # dev OOF остаётся честным. Веса не смешиваются: инференс их не меняет.
+        reuse = ft_cfg.get("reuse_models", None)
+        reuse_dir = cfg.resolve(str(reuse)) if reuse else None
+        if reuse_dir is not None and not reuse_dir.exists():
+            raise FileNotFoundError(f"reranker.fine_tune.reuse_models: нет каталога {reuse_dir}")
+        # resume_folds: добивка убитого прогона — полные фолд-модели ЭТОГО artifacts_dir
+        # переиспользуются, обучаются только недостающие. Опт-ин через
+        # `--set reranker.fine_tune.resume_folds=true`: молча не реюзаем, потому что
+        # совместимость весов со сменившимся конфигом здесь не проверяется.
+        resume_folds = bool(ft_cfg.get("resume_folds", False))
+        n_resumed = 0
 
         if ft_data == "synthetic":
             # Обучение не видит разметку calibration → модель честно OOF для dev и test,
             # фолды не нужны: одна модель, один инференс-проход.
-            groups = _synthetic_training_groups(cfg, ft_cfg, n_negatives=n_neg)
-            logger.info("fine-tune (synthetic): %d обучающих групп", len(groups))
-            model_dir = fine_tune_reranker(str(rr.model_name), groups, models_dir / "synthetic", seed=cfg.seed, **tune_kw)
+            if reuse_dir is not None:
+                model_dir = reuse_dir / "synthetic"
+                if not model_dir.exists():
+                    raise FileNotFoundError(f"reuse_models: нет {model_dir}")
+                logger.info("fine-tune (synthetic): reuse %s (без обучения)", model_dir)
+            else:
+                groups = _synthetic_training_groups(cfg, ft_cfg, n_negatives=n_neg)
+                logger.info("fine-tune (synthetic): %d обучающих групп", len(groups))
+                model_dir = fine_tune_reranker(str(rr.model_name), groups, models_dir / "synthetic", seed=cfg.seed, **tune_kw)
             ft_model = CrossEncoderReranker(
                 model_dir, device=str(device) if device else None,
                 max_length=int(rr.max_length), batch_size=int(rr.batch_size), use_fp16=bool(rr.use_fp16),
@@ -692,24 +715,40 @@ def stage_rerank(cfg: Config, *, force: bool = False) -> Path:
         else:
             qtext_by_qid = {int(q): qtext_cal[i] for i, q in enumerate(fusion_cal.query_ids)}
             cand_by_qid = {int(q): cand_cal[i] for i, q in enumerate(fusion_cal.query_ids)}
-            union_lists = [sorted(set(cand_cal[i]) | gt.get(int(q), set())) for i, q in enumerate(fusion_cal.query_ids)]
-            union_pass = dense.best_chunk_texts(q_cal_f, union_lists)
-            passage_of = {
-                (int(q), int(a)): union_pass[i][j]
-                for i, q in enumerate(fusion_cal.query_ids) for j, a in enumerate(union_lists[i])
-            }
+            # Обучающие пассажи (single best chunk) нужны только при реальном обучении.
+            if reuse_dir is None:
+                union_lists = [sorted(set(cand_cal[i]) | gt.get(int(q), set())) for i, q in enumerate(fusion_cal.query_ids)]
+                union_pass = dense.best_chunk_texts(q_cal_f, union_lists)
+                passage_of = {
+                    (int(q), int(a)): union_pass[i][j]
+                    for i, q in enumerate(fusion_cal.query_ids) for j, a in enumerate(union_lists[i])
+                }
 
             row_of = {int(q): i for i, q in enumerate(fusion_cal.query_ids)}
             oof_scores = np.full_like(zs_cal.scores, fill_value=zs_cal.scores.min())
             test_accum = np.zeros_like(zs_test.scores)
             for fold in range(splits.n_splits):
-                groups = build_training_groups(
-                    splits.train_ids(fold), qtext_by_qid, gt, cand_by_qid, passage_of, n_negatives=n_neg
-                )
-                logger.info("fine-tune fold %d: %d обучающих групп", fold, len(groups))
-                fold_dir = fine_tune_reranker(
-                    str(rr.model_name), groups, models_dir / f"fold_{fold}", seed=cfg.seed + fold, **tune_kw
-                )
+                if reuse_dir is not None:
+                    fold_dir = reuse_dir / f"fold_{fold}"
+                    if not fold_dir.exists():
+                        raise FileNotFoundError(f"reuse_models: нет {fold_dir}")
+                    logger.info("fine-tune fold %d: reuse %s (без обучения)", fold, fold_dir)
+                else:
+                    fold_dir = models_dir / f"fold_{fold}"
+                    # Полнота сохранённой модели: save_pretrained пишет config+веса,
+                    # затем токенайзер — проверяем последний записываемый файл тоже.
+                    complete = (fold_dir / "config.json").exists() and (fold_dir / "tokenizer_config.json").exists()
+                    if resume_folds and complete:
+                        n_resumed += 1
+                        logger.info("fine-tune fold %d: resume %s (обучение пропущено)", fold, fold_dir)
+                    else:
+                        groups = build_training_groups(
+                            splits.train_ids(fold), qtext_by_qid, gt, cand_by_qid, passage_of, n_negatives=n_neg
+                        )
+                        logger.info("fine-tune fold %d: %d обучающих групп", fold, len(groups))
+                        fold_dir = fine_tune_reranker(
+                            str(rr.model_name), groups, fold_dir, seed=cfg.seed + fold, **tune_kw
+                        )
                 fold_model = CrossEncoderReranker(
                     fold_dir, device=str(device) if device else None,
                     max_length=int(rr.max_length), batch_size=int(rr.batch_size), use_fp16=bool(rr.use_fp16),
@@ -751,6 +790,8 @@ def stage_rerank(cfg: Config, *, force: bool = False) -> Path:
     chosen_test.save(sd.path / "test.npz")
     sd.write_manifest(chosen=chosen, candidate_top_k=top_k, chunks_per_article=m_chunks,
                       fine_tune_data=str(ft_cfg.get("data", "labeled")) if bool(ft_cfg.enabled) else None,
+                      fine_tune_reused=str(ft_cfg.get("reuse_models")) if bool(ft_cfg.enabled) and ft_cfg.get("reuse_models") else None,
+                      fine_tune_folds_resumed=n_resumed if bool(ft_cfg.enabled) and n_resumed else None,
                       zero_shot_map=round(res_zs.map_at_k, 4),
                       fine_tune_map=round(res_ft.map_at_k, 4) if res_ft else None)
 
@@ -771,8 +812,34 @@ def _require(path: Path, produced_by: str) -> Path:
 
 
 # ─── стадия: финальный блэнд ─────────────────────────────────────────────
+def _build_graph_featurizer(cfg: Config, article_ids: np.ndarray) -> GraphFeaturizer:
+    """Собрать фолд-независимые входы граф-фич: HTML-ссылки + dense-векторы статей.
+
+    Всё — из уже готовых артефактов (articles.f и кэш dense-индекса), порядок
+    статей приводится к каноническому порядку колонок матриц скоров.
+    """
+    graph_cfg = cfg.section("ranking").graph_features
+    articles = load_articles(cfg)
+    body_of = {int(a): str(b) for a, b in zip(articles["article_id"], articles["body"])}
+    adj = link_adjacency(article_ids, [body_of[int(a)] for a in article_ids])
+
+    dense_index = _require(stage_dir(cfg, "scores") / "dense" / "index" / "meta.json", "retrieve").parent
+    dense = DenseRetriever.load(dense_index, encoder=None)
+    vec = article_vectors(dense.chunk_emb, dense.title_emb, dense.chunk_offsets)
+    vec = _reorder_rows(vec, dense.article_ids, article_ids)
+    logger.info("граф-фичи: %d статей, %d link-пар, dim=%d, top_m=%d",
+                len(article_ids), int(adj.sum()) // 2, vec.shape[1], int(graph_cfg.top_m))
+    return GraphFeaturizer(article_ids, link_adj=adj, article_vec=vec, top_m=int(graph_cfg.top_m),
+                           interaction=bool(graph_cfg.get("interaction", True)),
+                           co_weight=str(graph_cfg.get("co_weight", "cond")))
+
+
 def stage_blend(cfg: Config) -> Path:
-    """Финальное ранжирование: mini-LTR (дефолт) или ручной blend, честный OOF."""
+    """Финальное ранжирование: mini-LTR (LR/MLP-голова, опц. граф-фичи) или ручной blend.
+
+    Все включённые варианты оцениваются честным OOF и попадают в отчёт;
+    `ranking.method: auto` берёт лучший по OOF MAP@10 (фолбэк-паттерн §6).
+    """
     scores_dir = stage_dir(cfg, "scores")
     fusion_cal = ScoreMatrix.load(_require(scores_dir / "fusion" / "calibration.npz", "fuse"))
     fusion_test = ScoreMatrix.load(scores_dir / "fusion" / "test.npz")
@@ -794,23 +861,62 @@ def stage_blend(cfg: Config) -> Path:
     grid = int(ranking_cfg.weight_grid)
     l2 = float(ranking_cfg.ltr.l2)
     use_ranks = bool(ranking_cfg.ltr.use_ranks)
+    graph_cfg = ranking_cfg.get("graph_features", None)
+    mlp_cfg = ranking_cfg.get("mlp", None)
     ci_kw = dict(n_resamples=int(eval_cfg.bootstrap_resamples), ci=float(eval_cfg.ci), seed=cfg.seed)
 
+    featurizer = None
+    if graph_cfg is not None and bool(graph_cfg.enabled):
+        featurizer = _build_graph_featurizer(cfg, fusion_cal.article_ids)
+
+    def _make_mlp() -> MLPRankerLTR:
+        return MLPRankerLTR(
+            hidden=[int(h) for h in mlp_cfg.hidden], epochs=int(mlp_cfg.epochs),
+            lr=float(mlp_cfg.lr), weight_decay=float(mlp_cfg.weight_decay), seed=cfg.seed,
+        )
+
+    # OOF всех включённых вариантов — в отчёт; финал берёт настроенный method
+    # (auto = лучший по OOF MAP@10, фолбэк-паттерн §6).
     rows: list[dict] = []
-    # OOF обоих способов для сравнения; финал берёт настроенный method.
+    results: dict[str, object] = {}
+
+    def _add_variant(variant: str, oof_rankings: dict[int, list[int]]):
+        res = evaluate(oof_rankings, gt_dev, name=f"blend_{variant}/dev_oof" if variant != "blend" else "blend/dev_oof",
+                       k=k, recall_ks=recall_ks).compute_ci(**ci_kw)
+        rows.append({"retriever": "blend" if variant == "blend" else f"blend_{variant}", "split": "dev_oof", **res.to_row()})
+        results[variant] = res
+        logger.info(res.summary())
+        return res
+
     oof_manual, fold_weights = oof_blend(fusion_cal, reranker_cal, gt, splits, k=k, depth=depth, grid=grid)
-    res_manual = evaluate(oof_manual, gt_dev, name="blend/dev_oof", k=k, recall_ks=recall_ks).compute_ci(**ci_kw)
-    rows.append({"retriever": "blend", "split": "dev_oof", **res_manual.to_row()})
-    logger.info(res_manual.summary())
+    _add_variant("blend", oof_manual)
 
-    oof_lr, feature_names = oof_blend_ltr(src_cal, reranker_cal, gt, splits, names=names, l2=l2, use_ranks=use_ranks, depth=depth)
-    res_lr = evaluate(oof_lr, gt_dev, name="blend_lr/dev_oof", k=k, recall_ks=recall_ks).compute_ci(**ci_kw)
-    rows.append({"retriever": "blend_lr", "split": "dev_oof", **res_lr.to_row()})
-    logger.info(res_lr.summary())
+    oof_lr, _ = oof_blend_ltr(src_cal, reranker_cal, gt, splits, names=names, l2=l2, use_ranks=use_ranks, depth=depth)
+    _add_variant("lr", oof_lr)
 
-    res_primary = res_lr if method == "lr" else res_manual
+    if featurizer is not None:
+        oof_lr_graph, _ = oof_blend_ltr(src_cal, reranker_cal, gt, splits, names=names, l2=l2,
+                                        use_ranks=use_ranks, depth=depth, featurizer=featurizer)
+        _add_variant("lr_graph", oof_lr_graph)
 
-    # Значимость final→hybrid: против OOF-гибрида (per-query AP из этапа 5).
+    if mlp_cfg is not None and bool(mlp_cfg.enabled):
+        oof_mlp, _ = oof_blend_ltr(src_cal, reranker_cal, gt, splits, names=names, l2=l2, use_ranks=use_ranks,
+                                   depth=depth, featurizer=featurizer, head_factory=_make_mlp)
+        _add_variant("mlp", oof_mlp)
+
+    if method == "auto":
+        chosen = max(results, key=lambda v: results[v].map_at_k)
+        logger.info("ranking.method=auto: выбран %s (OOF MAP@10 %.4f)", chosen, results[chosen].map_at_k)
+    else:
+        # Явный method: lr при включённых граф-фичах означает lr_graph.
+        chosen = {"lr": "lr_graph" if featurizer is not None else "lr"}.get(method, method)
+    if chosen not in results:
+        raise ValueError(f"ranking.method={method!r} требует включённого варианта {chosen!r} "
+                         f"(есть: {sorted(results)}; проверьте ranking.mlp.enabled/graph_features.enabled)")
+    res_primary = results[chosen]
+
+    # Значимость: финал против OOF-гибрида (per-query AP из этапа 5) + попарно
+    # между вариантами головы (вклад граф-фич и нелинейности по отдельности).
     significance = {}
     fusion_ap_path = stage_dir(cfg, "runs") / "fusion_oof_ap.json"
     if fusion_ap_path.exists():
@@ -820,23 +926,36 @@ def stage_blend(cfg: Config) -> Path:
             np.array([res_primary.per_query_ap[q] for q in common]),
             np.array([fusion_ap[q] for q in common]), seed=cfg.seed,
         )
-        significance[f"{method}_vs_fusion"] = round(p, 4)
-        logger.info("значимость dev %s vs fusion: p=%.4f", method, p)
+        significance[f"{chosen}_vs_fusion"] = round(p, 4)
+    for a, b in (("lr_graph", "lr"), ("mlp", "lr_graph"), ("mlp", "lr")):
+        if a in results and b in results and not (a == "mlp" and b == "lr" and "lr_graph" in results):
+            qs = sorted(set(results[a].per_query_ap) & set(results[b].per_query_ap))
+            significance[f"{a}_vs_{b}"] = round(paired_permutation_test(
+                np.array([results[a].per_query_ap[q] for q in qs]),
+                np.array([results[b].per_query_ap[q] for q in qs]), seed=cfg.seed,
+            ), 4)
+    logger.info("значимость (permutation): %s", significance)
 
-    # Финал: обучаем/подбираем на всех dev.
+    # Финал: обучаем/подбираем выбранный вариант на всех dev; для теста граф
+    # строится по всей dev-разметке (test-запросы своих меток не имеют).
     final_weight = None
     coefficients: dict = {}
-    if method == "lr":
-        lr, feature_names = fit_blend_ltr(src_cal, reranker_cal, gt, splits.dev, names=names, l2=l2, use_ranks=use_ranks)
-        final_cal = predict_blend_ltr(lr, src_cal, reranker_cal, names=names, use_ranks=use_ranks)
-        final_test = predict_blend_ltr(lr, src_test, reranker_test, names=names, use_ranks=use_ranks)
-        coefficients = lr.coefficients(feature_names)
-        logger.info("итоговые коэффициенты mini-LTR (dev): %s", coefficients)
-    else:
+    if chosen == "blend":
         final_weight = search_blend_weight(fusion_cal, reranker_cal, gt, splits.dev, k=k, grid=grid)
         final_cal = blend_matrix(fusion_cal, reranker_cal, weight=final_weight)
         final_test = blend_matrix(fusion_test, reranker_test, weight=final_weight)
         logger.info("итоговый вес блэнда (dev): fusion=%.2f reranker=%.2f", final_weight, 1 - final_weight)
+    else:
+        f_used = featurizer if chosen in ("lr_graph", "mlp") else None
+        head = _make_mlp() if chosen == "mlp" else None
+        model, feature_names = fit_blend_ltr(src_cal, reranker_cal, gt, splits.dev, names=names,
+                                             l2=l2, use_ranks=use_ranks, featurizer=f_used, head=head)
+        predict_kw = dict(names=names, use_ranks=use_ranks, featurizer=f_used, gt_train=gt_dev)
+        final_cal = predict_blend_ltr(model, src_cal, reranker_cal, **predict_kw)
+        final_test = predict_blend_ltr(model, src_test, reranker_test, **predict_kw)
+        if chosen != "mlp":
+            coefficients = model.coefficients(feature_names)
+            logger.info("итоговые коэффициенты mini-LTR (dev): %s", coefficients)
 
     sd = StageDir(
         cfg, "scores", stage_dir(cfg, "scores", subdir="blend"), SCHEMA_BLEND,
@@ -847,14 +966,16 @@ def stage_blend(cfg: Config) -> Path:
     check_score_matrix(final_test, fusion_test.article_ids)
     final_cal.save(sd.path / "calibration.npz")
     final_test.save(sd.path / "test.npz")
-    sd.write_manifest(method=method, weight_fusion=final_weight, coefficients=coefficients,
+    sd.write_manifest(method=method, chosen=chosen, weight_fusion=final_weight, coefficients=coefficients,
+                      graph_features=featurizer is not None,
                       oof_map=round(res_primary.map_at_k, 4))
 
     runs_dir = stage_dir(cfg, "runs")
     created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     config_hash = cfg.hash_section("ranking", "reranker", "fusion", "retrievers", "preprocess")
     write_json(runs_dir / "blend_report.json",
-               {"created_at": created_at, "config_hash": config_hash, "method": method,
+               {"created_at": created_at, "config_hash": config_hash, "method": method, "chosen": chosen,
+                "graph_features": featurizer is not None,
                 "weight_fusion": final_weight, "coefficients": coefficients,
                 "significance": significance, "rows": rows})
     _append_experiments(runs_dir / "experiments.csv", rows, config_hash, created_at)

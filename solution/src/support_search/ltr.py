@@ -71,7 +71,10 @@ class LogisticRegressionLTR:
             self.std_[self.std_ == 0] = 1.0
         return (X - self.mean_) / self.std_
 
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "LogisticRegressionLTR":
+    def fit(self, X: np.ndarray, y: np.ndarray, groups: np.ndarray | None = None) -> "LogisticRegressionLTR":
+        # `groups` (индекс запроса строки) не используется: LR — pointwise. Параметр
+        # нужен для единого интерфейса со listwise-головами (ranking/mlp.py).
+        del groups
         Xs = self._prepare(X, fit=True)
         y = np.asarray(y, dtype=np.float64)
         n, d = Xs.shape

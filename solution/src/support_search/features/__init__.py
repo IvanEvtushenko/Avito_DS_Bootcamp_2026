@@ -1,5 +1,17 @@
-"""[TODO §7.1, план §5] Граф внутренних ссылок статей как источник признаков.
+"""Граф-фичи кандидатов (план §7.1): связи co-label / HTML-ссылки / dense-похожесть.
 
-Заглушка: рёбра article→article извлекает `preprocess.html.extract_article_links`;
-использование (фича blend/LTR, защита hard negatives) — отдельная ветка §7.1.
+Рёбра article→article извлекает `preprocess.html.extract_article_links`; здесь —
+сборка графов и признаков «кандидат связан с топ-соседями запроса» для mini-LTR
+(протокол без утечки — в докстринге `graphs`).
 """
+from __future__ import annotations
+
+from .graphs import GRAPH_FEATURES, GraphFeaturizer, article_vectors, co_label_weights, link_adjacency
+
+__all__ = [
+    "GRAPH_FEATURES",
+    "GraphFeaturizer",
+    "article_vectors",
+    "co_label_weights",
+    "link_adjacency",
+]

@@ -1,0 +1,37 @@
+# Ablation: граф-фичи (co-label / HTML-ссылки / dense-похожесть / прайор частоты)
+# и listwise MLP-голова поверх лемма-прогона (artifacts_rr_ft_lemma, OOF 0.7378).
+# Ретрив/реранк-секции идентичны rerank_ft_lemma.yaml → их кэш валиден, пересчёт
+# затрагивает только стадию blend (CPU, арифметика над матрицами). В отчёт
+# попадают все варианты: blend / lr / lr+graph / mlp; method=auto берёт лучший
+# по OOF (фолбэк-паттерн §6).
+#   cd solution && PYTHONPATH=src python3 -m support_search.cli blend --experiment rerank_ft_lemma_graph.yaml
+artifacts_dir: artifacts_rr_ft_lemma
+fusion:
+  candidate_top_k: 50
+evaluation:
+  recall_ks: [10, 20, 50, 100]
+reranker:
+  enabled: true
+  backend: sequence_classification
+  model_name: BAAI/bge-reranker-v2-m3
+  revision: 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
+  max_length: 512
+  batch_size: 64
+  use_fp16: true
+  candidate_top_k: 50
+  chunks_per_article: 3         # как в ночном прогоне (изоляция эффекта именно головы/фич)
+  fine_tune:
+    enabled: true
+    data: labeled
+    reuse_models: artifacts_rr_bge_ft_labeled/models/reranker_ft   # ночные 5 фолд-моделей
+ranking:
+  # Не auto: MLP на сиде по умолчанию случайно обходит LR (0.7499), но по
+  # ансамблю 5 сидов он ниже (0.7444 vs 0.7456) — auto выбрал бы шум сида.
+  # MLP оставлен включённым ради ablation-строки в отчёте.
+  method: lr
+  graph_features:
+    enabled: true
+    top_m: 3
+    co_weight: cond             # условная нормировка co-label (эксклюзивные пары)
+  mlp:
+    enabled: true

@@ -1,22 +1,26 @@
-"""Mini-LTR: финальное ранжирование логистической регрессией (план §7.2).
+"""Mini-LTR: финальное ранжирование обучаемой головой (план §7.2).
 
 Альтернатива ручному блэнду из `ranking/blend.py`. Вместо одного веса
-`w·fusion + (1-w)·reranker` обучаем LR поверх **всех** признаков кандидата:
+`w·fusion + (1-w)·reranker` обучаем модель поверх **всех** признаков кандидата:
 min-max-нормированные (внутри кандидатов запроса) скоры BM25, char-TF-IDF, dense и
-реранкера + их обратные ранги. Ранжирование — по P(релевантна).
+реранкера + их обратные ранги; опционально — граф-фичи связей кандидата с
+топ-соседями (`features/graphs.py`). Ранжирование — по P(релевантна).
 
-Так финальный скор объединяет все сигналы и их ранги сразу, а не через
-двухступенчатую ручную формулу; коэффициенты интерпретируемы. Обучение строго
-out-of-fold (§4.2); переставляются только кандидаты (recall@K — потолок).
+Голова сменная: LR (дефолт, коэффициенты интерпретируемы) или listwise MLP
+(`ranking/mlp.py`) — обе с одним интерфейсом `fit(X, y, groups)`/`predict_proba`.
+Обучение строго out-of-fold (§4.2); граф-фичи каждого фолда строятся только по
+его train-разметке (протокол — в докстринге `features/graphs.py`).
+Переставляются только кандидаты (recall@K — потолок).
 """
 from __future__ import annotations
 
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import numpy as np
 
 from ..contracts import ScoreMatrix, rank_indices
 from ..data.splits import Splits
+from ..features.graphs import GraphFeaturizer
 from ..ltr import LogisticRegressionLTR
 from ..rerank.apply import NON_CANDIDATE
 
@@ -96,22 +100,52 @@ def _scatter(proba_rows: np.ndarray, mask_rows: np.ndarray) -> np.ndarray:
     return out
 
 
+def _with_graph_features(
+    base: np.ndarray,
+    base_names: list[str],
+    reranker: ScoreMatrix,
+    mask: np.ndarray,
+    featurizer: GraphFeaturizer | None,
+    gt_train: Mapping[int, set[int]] | None,
+) -> tuple[np.ndarray, list[str]]:
+    """Базовые признаки + граф-фичи от разметки `gt_train` (если заданы)."""
+    if featurizer is None:
+        return base, base_names
+    extra = featurizer.features(reranker.scores, mask, reranker.query_ids, gt_train or {})
+    return np.concatenate([base, extra], axis=-1), base_names + featurizer.feature_names()
+
+
+def _fit_head(head, features: np.ndarray, labels: np.ndarray, rows: Sequence[int], mask: np.ndarray):
+    """Обучить голову на строках-кандидатах запросов `rows`; groups = запрос строки."""
+    sel = mask[rows]
+    groups = np.nonzero(sel)[0]  # индекс запроса каждой строки-кандидата
+    return head.fit(features[rows][sel], labels[rows][sel], groups)
+
+
 def fit_blend_ltr(
-    source_matrices, reranker, gt, subset_ids, *, names, l2=1.0, use_ranks=True
+    source_matrices, reranker, gt, subset_ids, *, names, l2=1.0, use_ranks=True,
+    featurizer: GraphFeaturizer | None = None, head=None,
 ) -> tuple[LogisticRegressionLTR, list[str]]:
-    features, feature_names, mask = build_blend_features(source_matrices, reranker, names=names, use_ranks=use_ranks)
+    """Обучить финальную голову на запросах `subset_ids` (граф — по их же разметке)."""
+    base, base_names, mask = build_blend_features(source_matrices, reranker, names=names, use_ranks=use_ranks)
+    gt_train = {int(q): gt[int(q)] for q in subset_ids if int(q) in gt}
+    features, feature_names = _with_graph_features(base, base_names, reranker, mask, featurizer, gt_train)
     labels = _labels(reranker.query_ids, reranker.article_ids, gt)
     row_of = {int(q): i for i, q in enumerate(reranker.query_ids)}
     rows = [row_of[int(q)] for q in subset_ids]
-    sel = mask[rows]
-    lr = LogisticRegressionLTR(l2=l2).fit(features[rows][sel], labels[rows][sel])
-    return lr, feature_names
+    model = _fit_head(head if head is not None else LogisticRegressionLTR(l2=l2), features, labels, rows, mask)
+    return model, feature_names
 
 
-def predict_blend_ltr(lr, source_matrices, reranker, *, names, use_ranks=True) -> ScoreMatrix:
-    features, _, mask = build_blend_features(source_matrices, reranker, names=names, use_ranks=use_ranks)
+def predict_blend_ltr(
+    model, source_matrices, reranker, *, names, use_ranks=True,
+    featurizer: GraphFeaturizer | None = None, gt_train: Mapping[int, set[int]] | None = None,
+) -> ScoreMatrix:
+    """Скоры головы; `gt_train` — та же разметка, на которой строился граф при fit."""
+    base, base_names, mask = build_blend_features(source_matrices, reranker, names=names, use_ranks=use_ranks)
+    features, _ = _with_graph_features(base, base_names, reranker, mask, featurizer, gt_train)
     n_feat = features.shape[-1]
-    proba = lr.predict_proba(features[mask].reshape(-1, n_feat))
+    proba = model.predict_proba(features[mask].reshape(-1, n_feat))
     scores = np.zeros(mask.shape, dtype=np.float32)
     scores[mask] = _CAND_BASE + proba.astype(np.float32)
     return ScoreMatrix(reranker.query_ids, reranker.article_ids, scores, BLEND_SOURCE)
@@ -127,25 +161,35 @@ def oof_blend_ltr(
     l2: float = 1.0,
     use_ranks: bool = True,
     depth: int = 100,
+    featurizer: GraphFeaturizer | None = None,
+    head_factory: Callable[[], object] | None = None,
 ) -> tuple[dict[int, list[int]], list[str]]:
-    """OOF-ранжирования dev: LR фолда учится на train(f), предсказывает val(f)."""
-    features, feature_names, mask = build_blend_features(source_matrices, reranker, names=names, use_ranks=use_ranks)
+    """OOF-ранжирования dev: голова фолда учится на train(f), предсказывает val(f).
+
+    Граф-фичи фолда строятся только по разметке train(f) — и для train-строк
+    (с leave-one-out внутри featurizer), и для val-строк (их GT в графе нет).
+    """
+    base, base_names, mask = build_blend_features(source_matrices, reranker, names=names, use_ranks=use_ranks)
     labels = _labels(reranker.query_ids, reranker.article_ids, gt)
     row_of = {int(q): i for i, q in enumerate(reranker.query_ids)}
-    n_feat = features.shape[-1]
     article_ids = reranker.article_ids
+    make_head = head_factory if head_factory is not None else (lambda: LogisticRegressionLTR(l2=l2))
 
     oof: dict[int, list[int]] = {}
+    feature_names = base_names
     for fold in range(splits.n_splits):
-        tr = [row_of[q] for q in splits.train_ids(fold)]
-        sel_tr = mask[tr]
-        lr = LogisticRegressionLTR(l2=l2).fit(features[tr][sel_tr], labels[tr][sel_tr])
+        train_ids = splits.train_ids(fold)
+        gt_train = {int(q): gt[int(q)] for q in train_ids if int(q) in gt}
+        features, feature_names = _with_graph_features(base, base_names, reranker, mask, featurizer, gt_train)
+        n_feat = features.shape[-1]
+        tr = [row_of[q] for q in train_ids]
+        model = _fit_head(make_head(), features, labels, tr, mask)
         for qid in splits.fold(fold):
             i = row_of[qid]
             row_scores = np.zeros(article_ids.shape[0], dtype=np.float32)
             cand = mask[i]
             if cand.any():
-                row_scores[cand] = _CAND_BASE + lr.predict_proba(features[i][cand].reshape(-1, n_feat)).astype(np.float32)
+                row_scores[cand] = _CAND_BASE + model.predict_proba(features[i][cand].reshape(-1, n_feat)).astype(np.float32)
             idx = rank_indices(row_scores, article_ids, depth)
             oof[qid] = article_ids[idx].tolist()
     return oof, feature_names

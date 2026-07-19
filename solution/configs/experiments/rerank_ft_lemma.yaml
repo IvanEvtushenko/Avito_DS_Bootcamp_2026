@@ -1,0 +1,27 @@
+# Ablation: лемматизация русского в лексике (BM25 + char-TF-IDF) поверх ночного FT.
+# Единственное отличие от прогона, давшего OOF 0.707 — pymorphy3-лемматизатор
+# (наследуется из default). Веса реранкера ПЕРЕИСПОЛЬЗУЮТСЯ (reuse_models, без
+# переобучения): пассажи реранкера = title+dense-чанк, от лемматизации не зависят;
+# фолды детерминированы (seed) → dev OOF честен и сравним с 0.707 напрямую.
+# Протокол держим как в ночном прогоне: top-50, chunks=3 (не текущий default 40),
+# чтобы изолировать эффект именно лемматизации.
+#   cd solution && PYTHONPATH=src HF_HUB_OFFLINE=1 python3 -m support_search.cli all --experiment rerank_ft_lemma.yaml
+artifacts_dir: artifacts_rr_ft_lemma
+fusion:
+  candidate_top_k: 50
+evaluation:
+  recall_ks: [10, 20, 50, 100]
+reranker:
+  enabled: true
+  backend: sequence_classification
+  model_name: BAAI/bge-reranker-v2-m3
+  revision: 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
+  max_length: 512
+  batch_size: 64
+  use_fp16: true
+  candidate_top_k: 50
+  chunks_per_article: 3         # как в ночном прогоне (изоляция эффекта лемматизации)
+  fine_tune:
+    enabled: true
+    data: labeled
+    reuse_models: artifacts_rr_bge_ft_labeled/models/reranker_ft   # ночные 5 фолд-моделей

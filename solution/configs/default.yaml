@@ -16,8 +16,8 @@ preprocess:
     # спойлеры/вкладки=label, списки, анкоры ссылок) сохраняется.
     drop_tags: [script, style, input, img, svg, button]
   normalize:
-    lemmatizer: auto            # auto | pymorphy3 | none  (auto = pymorphy3 если установлен)
-    tokenizer: auto             # auto | razdel | regex
+    lemmatizer: pymorphy3            # auto | pymorphy3 | none  (auto = pymorphy3 если установлен)
+    tokenizer: "razdel"             # auto | razdel | regex
     min_len: 2
     use_stopwords: true
     # Плейсхолдеры есть только в запросах, в статьях их нет (EDA). Значение =
@@ -100,10 +100,12 @@ reranker:                       # cross-encoder reranker (этап 6)
   batch_size: 64
   use_fp16: true
   candidate_top_k: 30           # сколько кандидатов fusion переоценивать
-  chunks_per_article: 40        # скор статьи = max по топ-m dense-чанкам; 40 = все чанки
+  chunks_per_article: 4         # скор статьи = max по топ-m dense-чанкам; 40 = все чанки
                                 # (медиана 1, 83% статей <=3; стоимость vs top-3 всего x1.5)
   fine_tune:                    # zero-shot по умолчанию; FT сравнивается по OOF (§6, фолбэк)
     enabled: false
+    reuse_models: null          # путь к готовым фолд-моделям → инференс без обучения
+                                # (переиспользовать веса под новый ретрив/препроцессинг)
     epochs: 2
     lr: 2.0e-5
     batch_groups: 4
@@ -111,11 +113,25 @@ reranker:                       # cross-encoder reranker (этап 6)
     max_length: 384
 
 ranking:                        # финальное ранжирование (этап 7)
-  method: lr                    # lr (mini-LTR §7.2, дефолт) | blend (ручной вес)
+  method: lr                    # lr (mini-LTR §7.2, дефолт) | blend (ручной вес) |
+                                # mlp (listwise-голова) | auto (лучший по OOF, фолбэк §6)
   weight_grid: 51               # размер сетки поиска веса для method=blend (ablation)
   ltr:                          # параметры mini-LTR
     l2: 1.0
     use_ranks: true
+  graph_features:               # фичи связей кандидата с топ-соседями (§7.1 + диагностика);
+    enabled: false              # граф фолда — только по его train-разметке (см. features/graphs.py)
+    top_m: 3                    # сколько топ-кандидатов реранкера считать «лидерами» запроса
+                                # (OOF-свип: top_m=2 хуже, top_m=5 не лучше)
+    interaction: true           # + co-фича × отрыв топ-1 (уверенность лидера)
+    co_weight: cond             # cond = P(кандидат|якорь), ловит эксклюзивные пары
+                                # («ходят именно друг с другом»); raw = log1p(вес) — ablation
+  mlp:                          # listwise MLP-голова (ranking/mlp.py); фичи те же, что у lr.
+    enabled: false              # Ablation: шире/дольше — переобучение (OOF 0.68→0.35);
+    hidden: [16]                # лучший крошечный вариант ≈ LR только на удачном сиде,
+    epochs: 300                 # ансамбль 5 сидов — чуть ниже LR (см. README) → дефолт lr.
+    lr: 0.01
+    weight_decay: 0.03
 
 evaluation:
   k: 10                         # MAP@k

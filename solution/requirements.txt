@@ -1,9 +1,3 @@
-# Pinned dependencies for reproducibility.
-#
-# The stage 1-3 lexical baseline runs on the "core" block only. These pins match
-# the versions available in the target environment (RTX 3060 workstation); adjust
-# to your own snapshot if you recreate the environment from scratch.
-
 # --- core (required for the lexical baseline) ---
 numpy==1.26.4
 scipy==1.11.4
@@ -14,14 +8,11 @@ lxml>=5.0
 omegaconf>=2.3
 tqdm==4.67.3
 
-# --- optional: Russian lemmatization / tokenization (auto-detected) ---
-# Improves BM25 recall on inflected Russian. The pipeline falls back to a
-# stemming-free regex tokenizer when these are not installed.
-# pymorphy3
-# pymorphy3-dicts-ru
-# razdel
+# Russian lemmatization
+pymorphy3
+pymorphy3-dicts-ru
+razdel
 
-# --- optional: dense retrieval + reranker (stages 4-7, not in this baseline) ---
-# sentence-transformers
-# torch==2.11.0
-# transformers==5.5.1
+# dense retrieval + reranker, sentence-transformers
+torch==2.11.0
+transformers==5.5.1

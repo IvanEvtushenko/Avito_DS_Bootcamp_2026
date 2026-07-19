@@ -1,0 +1,53 @@
+# Канонический ПОЛНЫЙ прогон: обучение сразу на всех 500 калибровочных (без
+# holdout), конфиг-победитель свипа (top-50, 3 эпохи, граф-голова cond).
+# Эквивалент фазы 3 refit_sweep.py — тот же artifacts_dir, resume_folds
+# подхватывает уже готовые фолд-модели.
+#
+# ОГОВОРКА ПРОТОКОЛА (для README): выбор конфига сделан честно на dev-400 OOF
+# (свип k30/k50 × epochs 1/2/3); здесь holdout входит в ОБУЧЕНИЕ финальных
+# test-моделей (план §4.5). Новые ветки, наследующие этот файл, учатся сразу
+# на 500 и оцениваются по OOF-500 — это слегка оптимистичнее dev-400-протокола
+# (данные бывшего holdout участвуют в отборе), осознанный размен ради скорости
+# на финише; независимым арбитром остаётся тестовая система (лучшая попытка).
+#
+# Новая ветка: скопировать файл, сменить artifacts_dir, убрать resume_folds.
+#   cd solution && PYTHONPATH=src HF_HUB_OFFLINE=1 python3 -m support_search.cli all --experiment rerank_ft_full500.yaml
+artifacts_dir: artifacts_rr_ft_final
+folds:
+  holdout_frac: 0.0             # все 500 — «dev»: 5 фолдов, честный OOF-500 внутри
+fusion:
+  candidate_top_k: 50
+evaluation:
+  recall_ks: [10, 20, 50, 100]
+reranker:
+  enabled: true
+  backend: sequence_classification
+  model_name: BAAI/bge-reranker-v2-m3
+  revision: 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
+  max_length: 512
+  batch_size: 64
+  use_fp16: true
+  candidate_top_k: 50
+  chunks_per_article: 3
+  fine_tune:
+    enabled: true
+    data: labeled
+    reuse_models: null
+    resume_folds: true          # добивка: полные фолд-модели не переобучаются
+    epochs: 3                   # победитель свипа (1→0.7361, 2→0.7514, 3→0.7608)
+    lr: 1.0e-5
+    schedule: cosine
+    warmup_ratio: 0.1
+    batch_groups: 4
+    n_negatives: 7
+    max_length: 384
+    freeze_embeddings: true
+ranking:
+  method: lr
+  graph_features:
+    enabled: true
+    top_m: 3
+    interaction: true
+    co_weight: cond
+  mlp:
+    enabled: false

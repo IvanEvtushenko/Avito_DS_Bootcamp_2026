@@ -1,0 +1,47 @@
+# Канонический конфиг ЛУЧШЕГО сабмита (test MAP@10 0.709361): top-50, 3 эпохи,
+# граф-голова cond — победитель свипа top_k × epochs (sweep_summary.json в
+# artifacts_rr_ft_final). Исходно прогон собран refit_sweep'ом с этими же
+# оверрайдами; этот файл — его воспроизводимая форма.
+#
+# Веса 5 фолд-моделей можно не обучать (~2.5–3.5 ч GPU): распаковать архив
+# reranker_ft_k50_ep3_weights.tar.gz в solution/ (лягут в
+# artifacts_rr_ft_k50_ep3/models/reranker_ft/fold_*) — resume_folds их
+# подхватит, останется только скоринг. Без архива обучение стартует с нуля.
+#   cd solution && PYTHONPATH=src HF_HUB_OFFLINE=1 python3 -m support_search.cli all --experiment rerank_ft_k50_ep3.yaml
+artifacts_dir: artifacts_rr_ft_k50_ep3
+fusion:
+  candidate_top_k: 50
+evaluation:
+  recall_ks: [10, 20, 50, 100]
+reranker:
+  enabled: true
+  backend: sequence_classification
+  model_name: BAAI/bge-reranker-v2-m3
+  revision: 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
+  max_length: 512
+  batch_size: 64
+  use_fp16: true
+  candidate_top_k: 50
+  chunks_per_article: 3
+  fine_tune:
+    enabled: true
+    data: labeled
+    reuse_models: null
+    resume_folds: true          # готовые фолд-модели (например, из архива весов) не переобучаются
+    epochs: 3                   # победитель свипа (1→0.7361, 2→0.7514, 3→0.7608)
+    lr: 1.0e-5
+    schedule: cosine
+    warmup_ratio: 0.1
+    batch_groups: 4
+    n_negatives: 7
+    max_length: 384
+    freeze_embeddings: true
+ranking:
+  method: lr
+  graph_features:
+    enabled: true
+    top_m: 3
+    interaction: true
+    co_weight: cond
+  mlp:
+    enabled: false

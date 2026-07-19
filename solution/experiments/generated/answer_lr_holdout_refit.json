@@ -1,0 +1,27 @@
+{
+  "artifact": "artifacts_rr_ft_k50_ep3",
+  "fit_on": "holdout",
+  "n_fit_queries": 100,
+  "reranker_feature": "mean of 5 fold models (as on test)",
+  "graph_gt": "dev + holdout (500), LOO at fit",
+  "l2": 1.0,
+  "use_ranks": true,
+  "coefficients": {
+    "bm25_norm": 0.221,
+    "bm25_rr": -0.0549,
+    "char_tfidf_norm": 0.2568,
+    "char_tfidf_rr": -0.1394,
+    "dense_norm": 0.4785,
+    "dense_rr": 0.0705,
+    "reranker_norm": 1.778,
+    "reranker_rr": 0.0169,
+    "co_top_p": 0.0274,
+    "link_top": -0.2871,
+    "sim_top": -0.2251,
+    "gt_freq": 0.6395,
+    "co_x_margin": 0.1854,
+    "bias": -3.1465
+  },
+  "holdout_train_map@10": 0.7144,
+  "answer": "/home/ivan/Desktop/Avito_summer_2026/try_0/solution/experiments/generated/answer_lr_holdout_refit.csv"
+}
